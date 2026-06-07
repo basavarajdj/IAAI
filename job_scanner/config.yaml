@@ -1,0 +1,32 @@
+# User job preferences — edit before scanning
+preferences:
+  roles:
+    - "Machine Learning Engineer"
+    - "Data Scientist"
+    - "Research Scientist"
+  industries:
+    - "Healthcare"
+    - "Banking"
+    - "Technology"
+  locations:
+    - "India"
+    - "Remote"
+  keywords:
+    - "python"
+    - "deep learning"
+    - "NLP"
+  exclude_keywords:
+    - "intern"
+    - "fresher only"
+
+search:
+  max_jobs_per_portal: 25
+  portals:
+    - linkedin
+    - naukri
+    - indeed
+
+output:
+  results_dir: output
+  applications_log: output/applications.jsonl
+  database: output/jobs.db

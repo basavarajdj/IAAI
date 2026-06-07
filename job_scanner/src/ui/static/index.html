@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Job Scanner</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="header">
+    <div>
+      <h1>Job Scanner</h1>
+      <p class="subtitle">Local jobs · match scores · application tracking</p>
+    </div>
+    <div class="stats" id="stats"></div>
+  </header>
+
+  <section class="toolbar">
+    <input type="search" id="search" placeholder="Search title, company, description…" />
+    <select id="portal">
+      <option value="">All portals</option>
+      <option value="linkedin">LinkedIn</option>
+      <option value="naukri">Naukri</option>
+      <option value="indeed">Indeed</option>
+    </select>
+    <select id="applied">
+      <option value="">All jobs</option>
+      <option value="false">Not applied</option>
+      <option value="true">Applied</option>
+    </select>
+    <input type="number" id="minScore" min="0" max="100" value="0" title="Min score" />
+    <button id="refreshBtn">Refresh</button>
+  </section>
+
+  <main class="layout">
+    <aside class="job-list" id="jobList">
+      <p class="muted">Loading jobs…</p>
+    </aside>
+    <article class="job-detail" id="jobDetail">
+      <div class="empty-state">
+        <h2>Select a job</h2>
+        <p>Choose a listing to view description, match reasoning, and apply actions.</p>
+      </div>
+    </article>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
