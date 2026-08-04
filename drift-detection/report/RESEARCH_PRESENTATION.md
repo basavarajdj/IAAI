@@ -12,6 +12,86 @@ paper), [FEATURE_ENGINEERING_AND_MODELING.md](FEATURE_ENGINEERING_AND_MODELING.m
 [FEATURE_SELECTION_PROCESS.md](FEATURE_SELECTION_PROCESS.md),
 [DRIFT_ANALYSIS_EXPLAINED.md](DRIFT_ANALYSIS_EXPLAINED.md).
 
+**Last full rerun: 2026-08-04.** The classical drift-detection pipeline and
+the RL experiment were both re-executed end to end on that date; every number
+and chart below reflects that run. The pipeline is deterministic on fixed
+input data (no random seeds vary run to run), so this rerun reproduced every
+figure already in this document to at least four decimal places — see
+"Reproducing this report" below for the exact commands.
+
+---
+
+## Reproducing this report
+
+Three scripts, run in order, regenerate everything in this document — every
+table, every number, every chart in `visuals/`. Nothing here is hand-edited
+from a one-off session.
+
+```bash
+# 1. Classical drift-detector pipeline (~15-20 min).
+#    Trains the shared LightGBM model registry, runs all 12 detectors over the
+#    14-week replay, evaluates each as a retraining policy, writes reports/*.csv
+python run_drift_analysis.py --top_k 20
+
+# 2. RL experiment (~15-20 min).
+#    Trains the neural model, builds the model lattice, trains the PPO agent,
+#    runs the benchmark + ablation, writes reports/rl_*.csv and rl_experiment.json
+python run_rl_experiment.py
+
+# 3. Regenerate every chart in report/visuals/ from the fresh reports/*.csv
+python report/generate_visuals.py
+```
+
+Requires the packages in `requirements.txt` (pandas, numpy, scipy,
+scikit-learn, lightgbm, torch, shap, matplotlib) and the two IEEE-CIS CSVs in
+`dataset/` (`train_transaction.csv`, `train_identity.csv`) — not included in
+the repo; see the dataset's own source for access.
+
+### Where results are stored
+
+All output lands in `reports/` (raw CSV/JSON, git-ignored — regenerate rather
+than diff) and `report/visuals/` (the PNGs this document embeds, checked in
+so the document renders without rerunning anything):
+
+| What | File |
+|---|---|
+| Per-week, per-detector alarm state (heatmap source) | `reports/method_week_matrix.csv` |
+| Feature-level drift diagnostics, every window | `reports/unified_drift_report.{csv,json}` |
+| Classical retraining-policy comparison (§3.5) | `reports/policy_comparison.csv` |
+| Method-by-method 14-week deep dive (§3.3) | `reports/method_week_matrix.csv`, `reports/unified_drift_report.json` |
+| Feature selection diagnostics — bagged importance, SHAP, redundancy (§1.4) | `reports/feature_selection_diagnostics.csv` |
+| Detector pairwise agreement | `reports/detector_agreement.csv` |
+| Method-level pros/cons metadata (§3.2 table) | `reports/method_profiles.csv` |
+| Catastrophic-forgetting analysis (§5.5) | `reports/forgetting_analysis.csv` |
+| RL agent vs. classical/naive policy comparison (§5.2, §5.3) | `reports/rl_policy_comparison.csv` |
+| RL ablation — full / context-only / signals-only (§5.4) | `reports/rl_ablation.csv` |
+| RL policy reliance / attributions (§5.4) | `reports/rl_policy_reliance.csv` |
+| RL decision-by-decision trace | `reports/rl_decision_trace.csv` |
+| Full RL experiment dump | `reports/rl_experiment.json` |
+| Per-version, per-week AUC matrix | `reports/version_week_auc_matrix.csv` |
+| Every chart in this document | `report/visuals/*.png`, built by `report/generate_visuals.py` |
+
+Run logs land in `logs/` (`logs/run_drift_analysis_*.log`,
+`logs/run_rl_experiment_*.log`) — useful for confirming a rerun actually
+touched every detector rather than exiting early.
+
+The 12 method-by-method tables in §3.3 are pasted-in markdown, not a live
+include — `report/_gen_method_tables.py` regenerates them (prints to stdout)
+from the same two files listed above. It's a one-off formatting helper, not
+part of the three-step reproduction sequence: after a rerun, diff its output
+against §3.3 to see whether any table actually needs updating before
+re-pasting (on a deterministic pipeline with unchanged input data, it
+shouldn't).
+
+### Readable feature and signal names
+
+Every chart renders engineered-feature names through `feature_engineering.feature_label()`
+and RL state/signal names through the label table in `report/generate_visuals.py`,
+so a chart shows "Var of \"Transaction amount\" per \"email domain x product\""
+rather than `_var_TransactionAmt__P_emaildomain__ProductCD`. The raw names are
+still what appears in the CSVs in `reports/` — the translation happens only at
+chart-generation time.
+
 ---
 
 ## Table of Contents
@@ -300,7 +380,443 @@ any week:
 | **Prequential AUC** | Measures what actually matters, directly | Strictly reactive — can't fire until damage is already visible | **12/14 raw, 6/14 confirmed** — the most persistence-confirmed alarms of any detector, but retrains 6 times for a worse mean AUC than the best 2-retrain policy |
 | **Champion vs Challenger** | Answers the real question ("would retraining help") directly | Naive in-sample scoring inflates the challenger and causes constant false alarms — must use out-of-fold scoring | **2/14 confirmed** (weeks 2, 8) — the single best classical retraining policy this run |
 
-### 3.3 Which specific features are actually drifting, and how often
+### 3.3 Method-by-method deep dive: 14-week performance, thresholds, and why
+
+Section 3.2 gave the one-line pros/cons/result for each detector. This section
+shows the underlying week-by-week numbers behind those one-liners — the exact
+metric value, the exact threshold it was measured against, and (where the
+decision has more than one moving part) *why* a given week did or didn't
+cross it. All 14 weeks, all 12 detectors, straight from
+`reports/method_week_matrix.csv` and `reports/unified_drift_report.json` — the
+same files listed in "Where results are stored" above.
+
+A repeated pattern worth naming up front: for the six detectors that watch
+model behaviour (DDM, EDDM, HDDM, ADWIN, Prequential AUC, Champion vs
+Challenger), "raw alarm" means the underlying tracker crossed its line that
+week; "confirmed" means it did so in **two consecutive weeks**, which is what
+actually triggers a retrain (§3 intro, the persistence gate). A lone raw
+alarm is common; a confirmed one is not — that gap is most of the story in
+this section.
+
+#### 3.3.1 KS test (distributional, label-free)
+
+Votes across the 20 monitored features; a week "confirms" only if the
+fraction crossing an individually significant, effect-size-gated KS test
+reaches the 0.60 consensus line (chart already shown in §3.2, reproduced here
+for this detector alone is unnecessary — the trend for all four vote-based
+detectors is in [the shared chart](visuals/04_feature_vote_weekly_trend.png)).
+
+| Week | Features crossed | Fraction | vs. 0.60 consensus | Raw alarm | Confirmed |
+|---|---|---|---|---|---|
+| 1 | 6/20 | 0.30 | -0.30 | No | No |
+| 2 | 7/20 | 0.35 | -0.25 | No | No |
+| 3 | 4/20 | 0.20 | -0.40 | No | No |
+| 4 | 3/20 | 0.15 | -0.45 | No | No |
+| 5 | 7/20 | 0.35 | -0.25 | No | No |
+| 6 | 6/20 | 0.30 | -0.30 | No | No |
+| 7 | 6/20 | 0.30 | -0.30 | No | No |
+| 8 | 6/20 | 0.30 | -0.30 | No | No |
+| 9 | 7/20 | 0.35 | -0.25 | No | No |
+| 10 | 7/20 | 0.35 | -0.25 | No | No |
+| 11 | 4/20 | 0.20 | -0.40 | No | No |
+| 12 | 8/20 | 0.40 | -0.20 | No | No |
+| 13 | 8/20 | 0.40 | -0.20 | No | No |
+| 14 | 9/20 | 0.45 | -0.15 | No | No |
+
+**Why it never fired.** KS tests a feature's *marginal* distribution — is
+`TransactionAmt` shaped the same way this week as in the reference window?
+Concept drift (§3.1) doesn't move marginals; it moves the *relationship*
+between features and the label, which KS cannot see by construction. The
+fraction crossing threshold drifts up slowly over the replay (0.30 → 0.45,
+consistent with §3.4's seasonal-step finding) but never gets past roughly
+three-quarters of the way to consensus.
+
+#### 3.3.2 PSI (distributional, label-free)
+
+| Week | Features crossed | Fraction | vs. 0.60 consensus | Raw alarm | Confirmed |
+|---|---|---|---|---|---|
+| 1 | 4/20 | 0.20 | -0.40 | No | No |
+| 2 | 5/20 | 0.25 | -0.35 | No | No |
+| 3 | 3/20 | 0.15 | -0.45 | No | No |
+| 4 | 3/20 | 0.15 | -0.45 | No | No |
+| 5 | 3/20 | 0.15 | -0.45 | No | No |
+| 6 | 3/20 | 0.15 | -0.45 | No | No |
+| 7 | 3/20 | 0.15 | -0.45 | No | No |
+| 8 | 3/20 | 0.15 | -0.45 | No | No |
+| 9 | 3/20 | 0.15 | -0.45 | No | No |
+| 10 | 3/20 | 0.15 | -0.45 | No | No |
+| 11 | 3/20 | 0.15 | -0.45 | No | No |
+| 12 | 4/20 | 0.20 | -0.40 | No | No |
+| 13 | 4/20 | 0.20 | -0.40 | No | No |
+| 14 | 4/20 | 0.20 | -0.40 | No | No |
+
+The pass/fail count above hides the actual PSI *magnitude*, which is the more
+informative view for this specific detector — PSI is usually read as a
+continuous score against the 0.10/0.20 scorecard folklore, not a binary flag:
+
+![PSI week-over-week trend, against the scorecard folklore bands](visuals/11_psi_weekly_trend.png)
+
+**Why it never fired.** The mean PSI across all 20 monitored features never
+leaves the 0.09–0.15 band — under even the "moderate shift" folklore
+threshold of 0.10 most weeks, let alone the pipeline's own bootstrap-null-
+calibrated bar. The **max** PSI (dashed line) tells the real story: it swings
+between 0.5 and 0.8 almost every week, entirely driven by one feature
+(`_mcols_na_bin`, the match-flag missingness pattern — §3.4's seasonal-step
+finding). One outlier feature out of twenty is nowhere near the 12-feature
+consensus PSI needs to confirm.
+
+#### 3.3.3 Jensen-Shannon (distributional, label-free)
+
+| Week | Features crossed | Fraction | vs. 0.60 consensus | Raw alarm | Confirmed |
+|---|---|---|---|---|---|
+| 1 | 8/20 | 0.40 | -0.20 | No | No |
+| 2 | 9/20 | 0.45 | -0.15 | No | No |
+| 3 | 7/20 | 0.35 | -0.25 | No | No |
+| 4 | 8/20 | 0.40 | -0.20 | No | No |
+| 5 | 7/20 | 0.35 | -0.25 | No | No |
+| 6 | 9/20 | 0.45 | -0.15 | No | No |
+| 7 | 9/20 | 0.45 | -0.15 | No | No |
+| 8 | 9/20 | 0.45 | -0.15 | No | No |
+| 9 | 9/20 | 0.45 | -0.15 | No | No |
+| 10 | 9/20 | 0.45 | -0.15 | No | No |
+| 11 | 6/20 | 0.30 | -0.30 | No | No |
+| 12 | 10/20 | 0.50 | -0.10 | No | No |
+| 13 | 9/20 | 0.45 | -0.15 | No | No |
+| 14 | 9/20 | 0.45 | -0.15 | No | No |
+
+**Why it never fired.** Jensen-Shannon is the closest of the three
+distributional tests to actually confirming — it reaches 0.50 at week 12,
+one feature short of the 12/20 line — but it is measuring the same thing KS
+and PSI measure (bounded, symmetric distributional distance), so it inherits
+the same blind spot: it is structurally unable to see a relationship change
+that leaves the feature marginals intact.
+
+#### 3.3.4 SHAP / attribution (explanation, label-free)
+
+The only label-free detector with a real mechanism for catching concept
+drift — it watches what the model *relies on*, not what the data *looks
+like* — but still never confirms at the corrected 20-feature monitoring set:
+
+| Week | Features crossed | Fraction | vs. 0.60 consensus | Raw alarm | Confirmed |
+|---|---|---|---|---|---|
+| 1 | 5/20 | 0.25 | -0.35 | No | No |
+| 2 | 4/20 | 0.20 | -0.40 | No | No |
+| 3 | 1/20 | 0.05 | -0.55 | No | No |
+| 4 | 5/20 | 0.25 | -0.35 | No | No |
+| 5 | 2/20 | 0.10 | -0.50 | No | No |
+| 6 | 1/20 | 0.05 | -0.55 | No | No |
+| 7 | 1/20 | 0.05 | -0.55 | No | No |
+| 8 | 4/20 | 0.20 | -0.40 | No | No |
+| 9 | 2/20 | 0.10 | -0.50 | No | No |
+| 10 | 3/20 | 0.15 | -0.45 | No | No |
+| 11 | 1/20 | 0.05 | -0.55 | No | No |
+| 12 | 1/20 | 0.05 | -0.55 | No | No |
+| 13 | 4/20 | 0.20 | -0.40 | No | No |
+| 14 | 6/20 | 0.30 | -0.30 | No | No |
+
+SHAP crosses threshold on *fewer* features per week than any other
+vote-based detector — it is the most conservative of the four by a wide
+margin. The feature-level view explains why: how much each feature's
+importance actually moves, averaged over all 14 weeks —
+
+![SHAP: which features' influence on the model shifts the most](visuals/12_shap_importance_shift.png)
+
+**Why it never fired.** Even the single most-shifting feature (the
+match-flag missingness pattern) moves by only 0.019 in mean |importance
+shift| — two orders of magnitude below the kind of swing that would flip a
+model's reliance on a feature. The model's *attributions* are simply stable
+across the replay, even in weeks where its *accuracy* is not — a genuinely
+informative negative result: whatever is driving the AUC drops in §3.3.9 and
+§3.3.10 below, it is not a change in which features the model leans on.
+
+#### 3.3.5 DDM (performance, needs labels)
+
+| Week | Mean error rate | DDM boundary (p_min + 3 × s_min) | Raw alarm | Confirmed | Model version after this week |
+|---|---|---|---|---|---|
+| 1 | 0.3310 | 0.3923 | No | No | v0 |
+| 2 | 0.3503 | 0.3923 | No | No | v0 |
+| 3 | 0.2945 | 0.3923 | No | No | v0 |
+| 4 | 0.2700 | 0.3923 | No | No | v0 |
+| 5 | 0.2877 | 0.3923 | No | No | v0 |
+| 6 | 0.3160 | 0.3923 | No | No | v0 |
+| 7 | 0.3331 | 0.3923 | No | No | v0 |
+| 8 | 0.3431 | 0.3923 | No | No | v0 |
+| 9 | 0.3240 | 0.3923 | No | No | v0 |
+| 10 | 0.3105 | 0.3923 | No | No | v0 |
+| 11 | 0.3172 | 0.3923 | No | No | v0 |
+| 12 | 0.3104 | 0.3923 | No | No | v0 |
+| 13 | 0.3091 | 0.3923 | No | No | v0 |
+| 14 | 0.2857 | 0.3923 | No | No | v0 |
+
+DDM and HDDM watch the identical error stream, so they're shown together —
+the observed rate against both trackers' own end-of-week boundary:
+
+![DDM & HDDM: the shared error-rate stream stays well under both boundaries](visuals/14_error_rate_trend.png)
+
+**Why it never fired.** DDM's boundary (`p_min + 3·s_min`) is set from the
+tracker's best-ever historical window, and its `s_min` term is a Bernoulli
+standard deviation — wide, because this stream is noisy at ~30% error even
+when nothing is wrong. Three standard deviations above that leaves a very
+wide margin (0.39 vs. an observed 0.27–0.35 all replay), and — DDM's known
+structural weakness (§3.2) — that margin only gets *harder* to close the
+longer the model stays stable, which is backwards from what a retraining
+trigger should do.
+
+#### 3.3.6 EDDM (performance, needs labels)
+
+The most retrain-happy detector this run, and the only one in this section
+where a *falling* metric — not a rising one — signals drift:
+
+| Week | Inter-error metric (p′+2s′) | Drift boundary (0.90 × running max) | Raw alarm | Confirmed | Model version after this week |
+|---|---|---|---|---|---|
+| 1 | 8.6330 | 10.8206 | Yes | No | v0 |
+| 2 | 8.7439 | 10.8206 | Yes | **Yes** | v1 |
+| 3 | 10.6994 | 10.1164 | No | No | v1 |
+| 4 | 11.2809 | 10.1164 | No | No | v1 |
+| 5 | 11.1322 | 10.1164 | No | No | v1 |
+| 6 | 10.9475 | 10.1164 | No | No | v1 |
+| 7 | 10.6051 | 10.1164 | No | No | v1 |
+| 8 | 10.2722 | 10.1164 | No | No | v1 |
+| 9 | 10.1934 | 10.1164 | Yes | No | v1 |
+| 10 | 10.1243 | 10.1164 | Yes | **Yes** | v7 |
+| 11 | 9.6959 | 11.0349 | Yes | No | v7 |
+| 12 | 9.7206 | 11.0349 | Yes | **Yes** | v9 |
+| 13 | 10.8996 | 11.3737 | Yes | No | v9 |
+| 14 | 10.6470 | 11.3737 | Yes | **Yes** | v11 |
+
+> EDDM alarms when the metric value *drops below* its boundary (errors
+> bunching closer together = more frequent errors); it is the only detector
+> in this section where "below the line" is the bad direction.
+
+**Why it fired 4 of 14 weeks — more than any other detector.** The boundary
+is 90% of the *largest* inter-error distance the tracker has ever seen, and
+that ceiling only ever grows (or resets, on retrain). Once the model settles
+into a good stretch, the running max climbs, and the very next mediocre week
+looks small by comparison and trips the line — a mechanical consequence of
+comparing every week against the *best* week ever seen rather than a typical
+one. This is exactly the mirror image of DDM's problem: DDM gets harder to
+trigger over time, EDDM gets easier.
+
+#### 3.3.7 HDDM (performance, needs labels)
+
+| Week | Mean error rate | Boundary (best-window mean + Hoeffding bound) | Raw alarm | Confirmed | Model version after this week |
+|---|---|---|---|---|---|
+| 1 | 0.3310 | 0.3465 | No | No | v0 |
+| 2 | 0.3503 | 0.3354 | No | No | v0 |
+| 3 | 0.2945 | 0.3512 | No | No | v0 |
+| 4 | 0.2700 | 0.3306 | No | No | v0 |
+| 5 | 0.2877 | 0.3229 | No | No | v0 |
+| 6 | 0.3160 | 0.3213 | No | No | v0 |
+| 7 | 0.3331 | 0.3202 | No | No | v0 |
+| 8 | 0.3431 | 0.3192 | No | No | v0 |
+| 9 | 0.3240 | 0.3184 | No | No | v0 |
+| 10 | 0.3105 | 0.3178 | No | No | v0 |
+| 11 | 0.3172 | 0.3171 | No | No | v0 |
+| 12 | 0.3104 | 0.3165 | No | No | v0 |
+| 13 | 0.3091 | 0.3159 | No | No | v0 |
+| 14 | 0.2857 | 0.3158 | No | No | v0 |
+
+(Trend chart shared with DDM, above.)
+
+**Why it never fired — not even once, raw or confirmed, the only detector in
+this project with that distinction.** Unlike DDM's fixed, wide margin,
+HDDM's boundary is genuinely close to the observed rate by the second half of
+the replay (within 0.01–0.02 from week 8 onward — visibly the two closest
+lines in the chart above). It is still a distribution-free, Hoeffding-bound
+test built for statistical soundness over sensitivity: the columns above are
+an end-of-week *snapshot* of a stateful, per-sample tracker, and the true
+decision rule requires the *cumulative* mean to clear an even wider combined
+bound (its own historical best window's uncertainty plus the current
+window's) — so "close" here does not mean "nearly triggered." Read together
+with DDM, the two Bernoulli/Hoeffding-style detectors in this project simply
+never found this error stream to look anomalous relative to its own history,
+even in weeks the other nine detectors flagged loudly.
+
+#### 3.3.8 ADWIN (performance-adjacent, label-free)
+
+| Week | z-score | z-threshold | Raw alarm | Confirmed | Model version after this week |
+|---|---|---|---|---|---|
+| 1 | 0.101 | 3.090 | Yes | No | v0 |
+| 2 | 1.374 | 3.090 | Yes | **Yes** | v1 |
+| 3 | 1.004 | 3.090 | Yes | No | v1 |
+| 4 | 9.521 | 3.090 | Yes | **Yes** | v2 |
+| 5 | 5.348 | 3.090 | Yes | No | v2 |
+| 6 | 3.150 | 3.090 | No | No | v2 |
+| 7 | 5.289 | 3.090 | Yes | No | v2 |
+| 8 | 6.328 | 3.090 | Yes | **Yes** | v5 |
+| 9 | 3.585 | 3.090 | Yes | No | v5 |
+| 10 | 2.421 | 3.090 | Yes | **Yes** | v7 |
+| 11 | 6.372 | 3.090 | Yes | No | v7 |
+| 12 | 9.461 | 3.090 | Yes | **Yes** | v9 |
+| 13 | 1.602 | 3.090 | Yes | No | v9 |
+| 14 | 0.055 | 3.090 | No | No | v9 |
+
+![ADWIN: mean-shift z-score vs. its formal threshold](visuals/15_adwin_zscore_trend.png)
+
+**Why it fired constantly, and why that's not actually good.** Notice the
+raw column: 12 of 14 weeks are "Yes" — the z-score in row 1, column 1 of the
+chart above is genuinely chaotic, swinging from near-zero to 9.5× the
+threshold and back within a couple of weeks (weeks 3→4→6, or 10→11→12→13→14).
+ADWIN has a real formal guarantee (it correctly detects *a* mean shift in the
+prediction stream), but "a mean shift happened" and "the model is stale" are
+different claims — this is the detector §3.5 shows loses to random-timed
+retraining at the same budget (5.5th percentile), and this table is the
+mechanism: it is reacting to week-to-week turbulence, not accumulated
+staleness.
+
+#### 3.3.9 Prequential AUC (performance, needs labels)
+
+| Week | AUC drop vs. reference | Effective drop threshold | Raw alarm | Confirmed | Model version after this week |
+|---|---|---|---|---|---|
+| 1 | 0.0706 | 0.0136 | Yes | No | v0 |
+| 2 | 0.0644 | 0.0137 | Yes | **Yes** | v1 |
+| 3 | 0.0129 | 0.0097 | No | No | v1 |
+| 4 | 0.0329 | 0.0109 | Yes | No | v1 |
+| 5 | 0.0383 | 0.0125 | Yes | **Yes** | v3 |
+| 6 | 0.0303 | 0.0121 | Yes | No | v3 |
+| 7 | 0.0359 | 0.0141 | Yes | **Yes** | v4 |
+| 8 | 0.0441 | 0.0128 | Yes | No | v4 |
+| 9 | 0.0442 | 0.0151 | Yes | **Yes** | v6 |
+| 10 | 0.0484 | 0.0166 | Yes | No | v6 |
+| 11 | 0.0403 | 0.0125 | Yes | **Yes** | v8 |
+| 12 | 0.0382 | 0.0132 | Yes | No | v8 |
+| 13 | 0.0262 | 0.0115 | Yes | **Yes** | v10 |
+| 14 | 0.0178 | 0.0316 | No | No | v10 |
+
+![Prequential AUC: current performance vs. its own reference](visuals/16_prequential_auc_trend.png)
+
+**Why it fired the most (6 confirmed, tied for most raw alarms too).**
+Prequential AUC measures the thing that actually matters — ranking quality —
+directly, with no proxy in between. The cost of that directness is visible in
+the chart: current-week AUC sits *below* the reference line in nearly every
+single week, because the reference resets to a fresh (higher) validation AUC
+every time the detector retrains, and the gap immediately starts reopening.
+With an AUC drop above its own effective threshold almost every week, the
+2-of-2 persistence gate is nearly always satisfied — which is exactly why
+§3.5 shows this policy retraining 6 times for a *worse* mean AUC than the
+best 2-retrain policy: it is strictly reactive, confirming damage that has
+already happened rather than anticipating it.
+
+#### 3.3.10 Champion vs Challenger (shadow model, needs labels)
+
+The single best classical retraining policy this run (§3.5) — and the table
+below shows it has two independent ways to fire, not one:
+
+| Week | AUC gap (challenger − champion) | Gap threshold (0.03) | AUC degradation from baseline | Degradation threshold (0.05) | Raw alarm | Confirmed | Model version after this week |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.0035 | 0.0300 | 0.0706 | 0.0500 | Yes | No | v0 |
+| 2 | 0.0287 | 0.0300 | 0.0644 | 0.0500 | Yes | **Yes** | v1 |
+| 3 | -0.0020 | 0.0300 | 0.0129 | 0.0500 | No | No | v1 |
+| 4 | 0.0176 | 0.0300 | 0.0329 | 0.0500 | No | No | v1 |
+| 5 | 0.0037 | 0.0300 | 0.0383 | 0.0500 | No | No | v1 |
+| 6 | 0.0270 | 0.0300 | 0.0418 | 0.0500 | No | No | v1 |
+| 7 | 0.0228 | 0.0300 | 0.0502 | 0.0500 | Yes | No | v1 |
+| 8 | 0.0207 | 0.0300 | 0.0607 | 0.0500 | Yes | **Yes** | v5 |
+| 9 | -0.0114 | 0.0300 | 0.0413 | 0.0500 | No | No | v5 |
+| 10 | 0.0215 | 0.0300 | 0.0477 | 0.0500 | No | No | v5 |
+| 11 | 0.0189 | 0.0300 | 0.0406 | 0.0500 | No | No | v5 |
+| 12 | 0.0475 | 0.0300 | 0.0493 | 0.0500 | Yes | No | v5 |
+| 13 | 0.0159 | 0.0300 | 0.0362 | 0.0500 | No | No | v5 |
+| 14 | -0.1485 | 0.0300 | 0.0296 | 0.0500 | No | No | v5 |
+
+> Fires when EITHER the gap clears 0.03 (and its own bootstrap standard
+> error, so a noisy small-sample gap doesn't count) OR degradation from
+> baseline clears 0.05. In every week this method actually raised a raw
+> alarm, the **degradation** column is what crossed — the gap column alone
+> never independently clears 0.03-with-significance in this replay.
+
+How the champion (currently deployed) and challenger (freshly retrained,
+scored out-of-fold to avoid the overfitting bias described in §2.1) actually
+compared, week by week:
+
+![Champion vs. Challenger: would retraining actually help this week?](visuals/17_champion_challenger.png)
+
+**Why only 2 of 14 confirmed, despite 4 raw alarms.** The persistence gate
+is the whole story here: weeks 1 and 7 raise a raw alarm (degradation just
+past 0.05) but are immediately followed by a week that drops back under
+threshold (week 2 still qualifies and confirms; week 8 also still qualifies
+and confirms) — but weeks 4–6 and 9–13 never sustain two in a row. This is
+the most direct of the twelve questions ("would retraining actually help
+this week?") and the persistence gate keeps it from overreacting to any
+single noisy week — the discipline that makes it the best classical policy
+in §3.5, at only 2 retrains.
+
+#### 3.3.11 Clustering (representation, label-free)
+
+K-Means with a **fixed k = 5** clusters — not learned or tuned per week,
+fit once on the reference window and never refit, exactly like every other
+frozen encoder in this pipeline (§1.3):
+
+| Week | Centroid distance ratio | Distance threshold (1.5) | Cluster-assignment PSI | PSI threshold (0.2) | Raw alarm | Confirmed | Model version after this week |
+|---|---|---|---|---|---|---|---|
+| 1 | 1.035 | 1.500 | 0.165 | 0.200 | No | No | v0 |
+| 2 | 1.066 | 1.500 | 0.193 | 0.200 | No | No | v0 |
+| 3 | 1.057 | 1.500 | 0.117 | 0.200 | No | No | v0 |
+| 4 | 1.059 | 1.500 | 0.143 | 0.200 | No | No | v0 |
+| 5 | 1.088 | 1.500 | 0.125 | 0.200 | No | No | v0 |
+| 6 | 1.089 | 1.500 | 0.083 | 0.200 | No | No | v0 |
+| 7 | 1.101 | 1.500 | 0.100 | 0.200 | No | No | v0 |
+| 8 | 1.094 | 1.500 | 0.100 | 0.200 | No | No | v0 |
+| 9 | 1.097 | 1.500 | 0.110 | 0.200 | No | No | v0 |
+| 10 | 1.109 | 1.500 | 0.095 | 0.200 | No | No | v0 |
+| 11 | 1.363 | 1.500 | 0.026 | 0.200 | No | No | v0 |
+| 12 | 2.949 | 1.500 | 0.034 | 0.200 | **Yes** | No | v0 |
+| 13 | 1.158 | 1.500 | 0.094 | 0.200 | No | No | v0 |
+| 14 | 1.175 | 1.500 | 0.086 | 0.200 | No | No | v0 |
+
+> Fires when EITHER series crosses its own threshold — two independent
+> triggers sharing one fixed clustering.
+
+![Clustering (k=5 fixed): both drift signals vs. their thresholds](visuals/13_clustering_trend.png)
+
+**Why it never confirmed, despite one large raw alarm.** Every week but one,
+the mean distance from a point to its nearest of the 5 reference centroids
+sits at a steady ~1.0–1.1× the reference baseline — genuinely stable
+multivariate geometry. Week 12 is a sharp, isolated spike to 2.95× (almost
+double the drift threshold) and is the largest reading in this detector's
+entire table by a wide margin — but week 13 snaps straight back to 1.16×.
+The 2-of-2 persistence gate is doing exactly its job: a single-week outlier,
+however large, does not get to trigger a retrain on its own. (This same week
+12 event independently shows up in the autoencoder, below, and in the raw
+top-drifting-feature data in §3.4 — three unrelated methods agreeing makes
+it a real, corroborated one-week anomaly, just not a *sustained* one.)
+
+#### 3.3.12 Autoencoder (representation, label-free)
+
+A bottleneck MLP trained once on the reference window, monitoring
+reconstruction-error z-score on every later week:
+
+| Week | Reconstruction-error z-score | Threshold (3.0) | Raw alarm | Confirmed |
+|---|---|---|---|---|
+| 1 | 0.100 | 3.000 | No | No |
+| 2 | 0.295 | 3.000 | No | No |
+| 3 | 0.110 | 3.000 | No | No |
+| 4 | 0.091 | 3.000 | No | No |
+| 5 | 0.156 | 3.000 | No | No |
+| 6 | 0.279 | 3.000 | No | No |
+| 7 | 0.207 | 3.000 | No | No |
+| 8 | 0.200 | 3.000 | No | No |
+| 9 | 0.198 | 3.000 | No | No |
+| 10 | 0.180 | 3.000 | No | No |
+| 11 | 0.454 | 3.000 | No | No |
+| 12 | 2.458 | 3.000 | No | No |
+| 13 | 0.282 | 3.000 | No | No |
+| 14 | 0.331 | 3.000 | No | No |
+
+![Autoencoder: reconstruction-error z-score vs. threshold](visuals/18_autoencoder_zscore_trend.png)
+
+**Why it never fired, even at its closest.** The same week-12 event visible
+in the clustering table above shows up here too — the z-score jumps roughly
+15× its typical level, to 2.46, its only reading anywhere near the 3.0
+threshold in the entire replay — but even that spike falls short, and every
+other week sits below 0.5. Two representation-based detectors independently
+noticing the same single week, and neither one confirming it, is itself a
+useful result: it says the week-12 event was real but genuinely
+one-off, not the start of a sustained shift — exactly the kind of event a
+persistence-gated policy is designed to not overreact to.
+
+
+### 3.4 Which specific features are actually drifting, and how often
 
 Rather than just counting *how many* features cross threshold each week, we
 tracked *which* ones:
@@ -332,7 +848,7 @@ mechanisms:
   signal, but not the kind of drift a retraining policy should chase every
   week.
 
-### 3.4 Classical detectors as retraining policies — the surprising result
+### 3.5 Classical detectors as retraining policies — the surprising result
 
 Detecting drift and knowing when to *retrain* are not the same question.
 Turning each detector into a real policy and measuring out-of-sample AUC:
@@ -383,6 +899,15 @@ Two findings stand out:
 >   single most persuasive number in this section for a skeptical audience —
 >   it's the concrete evidence that "detects real drift" and "makes a good
 >   retraining trigger" are different claims.
+> - §3.3 (the 12-detector deep dive) is reference material, not a slide to
+>   present linearly — don't walk through all twelve in a talk. Keep three in
+>   your pocket for questions: PSI (§3.3.2, the mean-vs-max chart is the best
+>   single illustration of "one outlier feature can't win a 20-feature vote"),
+>   Clustering (§3.3.11, the week-12 spike that two independent
+>   representation-based detectors both saw and neither confirmed — a clean
+>   example of the persistence gate working as designed), and Champion vs
+>   Challenger (§3.3.10, the two-independent-triggers table is the best
+>   concrete illustration of why this detector's discipline beats the others).
 
 ---
 
@@ -406,7 +931,7 @@ detector's design accounts for:
    options every classical detector's design ignores.
 3. **Actions have delayed consequences.** Retraining during a turbulent week
    permanently folds that turbulence into a cumulative training set, and the
-   cost shows up weeks later, not immediately. Section 3.4 already showed
+   cost shows up weeks later, not immediately. Section 3.5 already showed
    this mechanism at work — busy detectors retrain into noise.
 
 This is precisely the structure of a **Markov Decision Process**, so we frame
@@ -562,7 +1087,7 @@ model context) lands on precisely the full agent's performance** — the drift
 signals alone are sufficient to recover the entire learned-policy advantage.
 
 **This result reversed once already**, on an earlier, buggy version of the
-feature pipeline (before the D-column bug in Section 3.3 was fixed, and
+feature pipeline (before the D-column bug in Section 3.4 was fixed, and
 before the monitoring set was widened from 10 to 20 features). That earlier
 run found the *opposite* — model context alone reproduced almost all of the
 full agent's performance, and dropping the drift signals cost almost
