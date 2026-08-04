@@ -1,0 +1,18 @@
+# Data
+dataset/
+
+# Generated pipeline outputs (regenerate via run_drift_analysis.py / run_rl_experiment.py)
+reports/
+models/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pkl
+*.pt
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
