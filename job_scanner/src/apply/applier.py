@@ -48,17 +48,7 @@ class JobApplier:
                 continue
             job_pk = normalize_job_key(m.job.portal, m.job.job_id, m.job.url)
             if self.store and self.store.is_applied(job_pk):
-                records.append(
-                    ApplicationRecord(
-                        job_url=m.job.url,
-                        portal=m.job.portal,
-                        title=m.job.title,
-                        company=m.job.company,
-                        match_score=m.score,
-                        status="skipped",
-                        message="Already applied — skipped duplicate.",
-                    )
-                )
+                records.append(self._skipped_record(m, "Already applied — skipped duplicate."))
                 continue
             to_apply.append(m)
 
@@ -80,22 +70,13 @@ class JobApplier:
         headless = self.env.playwright_headless
         slow_mo = self.env.playwright_slow_mo_ms
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=headless, slow_mo=slow_mo)
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=headless, slow_mo=slow_mo)
             try:
                 for m in to_apply:
                     job_pk = normalize_job_key(m.job.portal, m.job.job_id, m.job.url)
                     if self.store and self.store.is_applied(job_pk):
-                        rec = ApplicationRecord(
-                            job_url=m.job.url,
-                            portal=m.job.portal,
-                            title=m.job.title,
-                            company=m.job.company,
-                            match_score=m.score,
-                            status="skipped",
-                            message="Already applied — skipped duplicate.",
-                        )
-                        records.append(rec)
+                        records.append(self._skipped_record(m, "Already applied — skipped duplicate."))
                         continue
                     rec = await self._apply_one(browser, m, profile)
                     records.append(rec)
@@ -103,6 +84,17 @@ class JobApplier:
             finally:
                 await browser.close()
         return records
+
+    def _skipped_record(self, match: MatchResult, message: str) -> ApplicationRecord:
+        return ApplicationRecord(
+            job_url=match.job.url,
+            portal=match.job.portal,
+            title=match.job.title,
+            company=match.job.company,
+            match_score=match.score,
+            status="skipped",
+            message=message,
+        )
 
     def _persist(self, record: ApplicationRecord, match: MatchResult) -> None:
         self._append_log(record)
@@ -154,27 +146,35 @@ class JobApplier:
             if self.mode != "assisted":
                 await page.close()
 
-    async def _ensure_linkedin_login(self, page: Page) -> None:
-        email, password = self.env.linkedin_email, self.env.linkedin_password
+    async def _do_login(self, page: Page, url: str, email_field: str, password_field: str, email: str, password: str) -> None:
         if not email or not password:
             return
-        await page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded")
-        if await page.locator("input#username").count():
-            await page.fill("input#username", email)
-            await page.fill("input#password", password)
+        await page.goto(url, wait_until="domcontentloaded")
+        if await page.locator(email_field).count():
+            await page.fill(email_field, email)
+            await page.fill(password_field, password)
             await page.click("button[type=submit]")
             await page.wait_for_timeout(5000)
 
+    async def _ensure_linkedin_login(self, page: Page) -> None:
+        await self._do_login(
+            page,
+            "https://www.linkedin.com/login",
+            "input#username",
+            "input#password",
+            self.env.linkedin_email,
+            self.env.linkedin_password,
+        )
+
     async def _ensure_naukri_login(self, page: Page) -> None:
-        email, password = self.env.naukri_email, self.env.naukri_password
-        if not email or not password:
-            return
-        await page.goto("https://www.naukri.com/nlogin/login", wait_until="domcontentloaded")
-        if await page.locator("input#usernameField").count():
-            await page.fill("input#usernameField", email)
-            await page.fill("input#passwordField", password)
-            await page.click("button[type=submit]")
-            await page.wait_for_timeout(5000)
+        await self._do_login(
+            page,
+            "https://www.naukri.com/nlogin/login",
+            "input#usernameField",
+            "input#passwordField",
+            self.env.naukri_email,
+            self.env.naukri_password,
+        )
 
     async def _apply_linkedin(self, page: Page, url: str, profile: ResumeProfile) -> tuple[str, str]:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)

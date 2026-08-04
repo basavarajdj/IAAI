@@ -95,6 +95,7 @@ async function renderDetail(id) {
       <a href="${esc(j.url)}" target="_blank" rel="noopener">Open on portal</a>
       <button class="primary" id="applyBtn" ${applied ? "disabled" : ""}>${applied ? "Already applied" : "Apply"}</button>
       <button class="secondary" id="markBtn" ${applied ? "disabled" : ""}>Mark as applied</button>
+      <button class="danger" id="deleteBtn">Delete</button>
     </div>
 
     <div class="section">
@@ -131,6 +132,7 @@ async function renderDetail(id) {
     $("#applyBtn")?.addEventListener("click", () => applyJob(id));
     $("#markBtn")?.addEventListener("click", () => markApplied(id));
   }
+  $("#deleteBtn")?.addEventListener("click", () => deleteJob(id));
 }
 
 async function applyJob(id) {
@@ -149,6 +151,17 @@ async function applyJob(id) {
     $("#applyBtn").disabled = false;
     $("#applyBtn").textContent = "Apply";
   }
+}
+
+async function deleteJob(id) {
+  if (!confirm("Delete this job? It will be hidden and skipped on future scans.")) return;
+  const res = await fetch(`/api/jobs/${encodeURIComponent(id)}/delete`, { method: "POST" });
+  const data = await res.json();
+  showToast(data.message || "Deleted");
+  selectedId = null;
+  jobDetail.innerHTML = '<div class="empty-state"><h2>Job deleted</h2><p>Select another job from the list.</p></div>';
+  await loadStats();
+  await loadJobs();
 }
 
 async function markApplied(id) {

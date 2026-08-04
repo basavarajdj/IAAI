@@ -146,6 +146,7 @@ body {
 }
 .detail-actions .primary { background: var(--accent2); border-color: var(--accent2); color: #052e16; font-weight: 600; }
 .detail-actions .secondary { background: var(--panel2); }
+.detail-actions .danger { background: var(--danger); border-color: var(--danger); color: #fff; font-weight: 600; }
 .detail-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .section {

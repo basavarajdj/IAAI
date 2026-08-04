@@ -10,30 +10,42 @@ import httpx
 
 
 class OllamaClient:
-    """Local LLM via Ollama API."""
-
     def __init__(self, host: str, model: str, timeout: float = 300.0) -> None:
         self.host = host.rstrip("/")
         self.model = model
         self.timeout = timeout
 
-    def generate(self, prompt: str, system: str | None = None) -> str:
-        messages: list[dict[str, str]] = []
+    def _build_payload(
+        self,
+        prompt: str,
+        system: str | None = None,
+        images: list[str] | None = None,
+        temperature: float = 0.2,
+    ) -> dict[str, Any]:
+        messages: list[dict[str, Any]] = []
         if system:
             messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-
-        payload = {
+        user_msg: dict[str, Any] = {"role": "user", "content": prompt}
+        if images:
+            user_msg["images"] = images
+        messages.append(user_msg)
+        return {
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": 0.2},
+            "options": {"temperature": temperature},
         }
+
+    def _post(self, payload: dict[str, Any]) -> str:
         with httpx.Client(timeout=self.timeout) as client:
             r = client.post(f"{self.host}/api/chat", json=payload)
             r.raise_for_status()
             data = r.json()
         return data.get("message", {}).get("content", "").strip()
+
+    def generate(self, prompt: str, system: str | None = None) -> str:
+        payload = self._build_payload(prompt, system=system)
+        return self._post(payload)
 
     def generate_json(self, prompt: str, system: str | None = None) -> dict[str, Any]:
         raw = self.generate(prompt, system=system)
@@ -46,31 +58,12 @@ class OllamaClient:
         *,
         system: str | None = None,
     ) -> str:
-        images_b64: list[str] = []
-        for path in image_paths:
-            images_b64.append(base64.b64encode(path.read_bytes()).decode("ascii"))
-
-        messages: list[dict[str, Any]] = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append(
-            {
-                "role": "user",
-                "content": prompt,
-                "images": images_b64,
-            }
-        )
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": False,
-            "options": {"temperature": 0.1},
-        }
-        with httpx.Client(timeout=self.timeout) as client:
-            r = client.post(f"{self.host}/api/chat", json=payload)
-            r.raise_for_status()
-            data = r.json()
-        return data.get("message", {}).get("content", "").strip()
+        images_b64 = [
+            base64.b64encode(path.read_bytes()).decode("ascii")
+            for path in image_paths
+        ]
+        payload = self._build_payload(prompt, system=system, images=images_b64, temperature=0.1)
+        return self._post(payload)
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -83,5 +76,8 @@ def _extract_json(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         start, end = text.find("{"), text.rfind("}")
         if start >= 0 and end > start:
-            return json.loads(text[start : end + 1])
-        raise
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                pass
+    return {}

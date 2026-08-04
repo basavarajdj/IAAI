@@ -13,11 +13,13 @@ async def scrape_indeed(
     query: str,
     location: str,
     limit: int,
+    *,
+    max_days_old: int = 7,
 ) -> list[JobListing]:
     page = await browser.new_page()
     jobs: list[JobListing] = []
     try:
-        params = urllib.parse.urlencode({"q": query, "l": location})
+        params = urllib.parse.urlencode({"q": query, "l": location, "fromage": max_days_old})
         url = f"https://www.indeed.com/jobs?{params}"
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(3000)
@@ -64,7 +66,6 @@ async def scrape_indeed(
                     url=href,
                 )
             )
-
     finally:
         await page.close()
     return jobs

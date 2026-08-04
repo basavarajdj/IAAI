@@ -13,11 +13,13 @@ async def scrape_linkedin(
     query: str,
     location: str,
     limit: int,
+    *,
+    max_days_old: int = 7,
 ) -> list[JobListing]:
     page = await browser.new_page()
     jobs: list[JobListing] = []
     try:
-        params = urllib.parse.urlencode({"keywords": query, "location": location})
+        params = urllib.parse.urlencode({"keywords": query, "location": location, "f_TPR": f"r{max_days_old * 86400}"})
         url = f"https://www.linkedin.com/jobs/search/?{params}"
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(3000)
@@ -63,7 +65,6 @@ async def scrape_linkedin(
                     url=href.split("?")[0],
                 )
             )
-
     finally:
         await page.close()
     return jobs
@@ -74,4 +75,3 @@ def _linkedin_id(url: str) -> str:
     if m:
         return m.group(1) or m.group(2) or url
     return url.rstrip("/").split("/")[-1]
-

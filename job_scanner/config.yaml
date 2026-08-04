@@ -1,26 +1,75 @@
 # User job preferences — edit before scanning
 preferences:
   roles:
-    - "Machine Learning Engineer"
-    - "Data Scientist"
+    - "Senior AI Engineer"
+    - "Senior AI Architect"
+    - "Senior Research Scientist"
+    - "Senior Data Scientist"
+    - "Senior Machine Learning Engineer"
+    - "Senior AI Scientist"
+    - "Senior NLP Engineer"
+    - "NLP Engineer"
+    - "AI Engineer"
+    - "AI Architect"
     - "Research Scientist"
+    - "ML Engineer"
+    - "Data Analyst"
   industries:
     - "Healthcare"
-    - "Banking"
+    - "Finance"
     - "Technology"
+    - "Manufacturing"
+    - "Retail"
+    - "Education"
+    - "Energy"
+    - "Transportation"
+    - "Other"
   locations:
-    - "India"
-    - "Remote"
+    - "Bangalore"
+    - "Bengaluru"
+    - "Pune"
   keywords:
     - "python"
     - "deep learning"
+    - "machine learning"
+    - "data science"
+    - "data engineering"
+    - "data analysis"
+    - "data visualization"
+    - "data mining"
+    - "data modeling"
+    - "data warehousing"
+    - "data integration"
     - "NLP"
+    - "LLM"
+    - "RAG"
+    - "Agentic AI"
+    - "AI Governance"
+  exclude_companies:
+    - "Accenture"
+    - "Tata Consultancy Services"
+    - "Infosys"
+    - "Wipro"
+    - "HCL"
+    - "Capgemini"
+    - "Cognizant"
+    - "KPMG"
+    - "EY"
+    - "Deloitte"
+    - "PWC"
+    - "ZS Associates"
+    - "Evalueserve"
+    - "IBM"
+    - "McKinsey & Company"
+    - "BCG"
+    - "Bain & Company"
   exclude_keywords:
     - "intern"
     - "fresher only"
 
 search:
-  max_jobs_per_portal: 25
+  max_jobs_per_portal: 50
+  max_days_old: 7
   portals:
     - linkedin
     - naukri

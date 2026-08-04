@@ -1,0 +1,142 @@
+{
+  "personal_information": {
+    "name": "Basavaraj D Jakkannavar",
+    "phone": "+91-7795671699",
+    "email": "cse.basavaraj@gmail.com",
+    "address": {
+      "locality": "Saraswathi Nagar",
+      "city": "Bengaluru",
+      "postal_code": "560040"
+    }
+  },
+  "summary": "Senior Data Scientist with 11 years of experience building large-scale machine learning systems and enterprise AI solutions across multiple industries. Proven expertise in deploying production ML systems, developing transformer-based NLP solutions, and designing scalable MLOps pipelines. Experienced in customer analytics, fraud detection, forecasting, recommendation systems, and generative AI applications. Recently focused on LLM-powered applications and agentic AI systems for enterprise automation.",
+  "skills": {
+    "machine_learning_and_ai": [
+      "Machine Learning",
+      "Deep Learning",
+      "NLP",
+      "Transformer Models",
+      "Generative AI",
+      "LLM Fine-tuning",
+      "Agentic AI Systems",
+      "Recommendation Systems"
+    ],
+    "programming": [
+      "Python",
+      "SQL",
+      "Java",
+      "PySpark"
+    ],
+    "ml_frameworks": [
+      "PyTorch",
+      "TensorFlow",
+      "Scikit-learn",
+      "HuggingFace"
+    ],
+    "data_platforms": [
+      "Snowflake",
+      "BigQuery",
+      "Azure Synapse",
+      "AWS Athena",
+      "S3"
+    ],
+    "mlops_and_infrastructure": [
+      "Azure ML",
+      "CI/CD",
+      "Docker",
+      "Kubernetes",
+      "Model Monitoring"
+    ],
+    "data_engineering": [
+      "ETL Pipelines",
+      "Airflow",
+      "Data Warehousing",
+      "Feature Engineering",
+      "PowerBI"
+    ]
+  },
+  "work_experience": [
+    {
+      "company": "ConnectWise",
+      "role": "Senior Data Scientist",
+      "start_date": "2024-01",
+      "end_date": "Present",
+      "is_current": true,
+      "responsibilities": [
+        "Architected a multi-agent AI system for automated ticket routing, where specialized agents predict attributes such as board, priority, contact, and company to route 2.1M+ support tickets per quarter.",
+        "Developed a GEPA-based prompt optimization framework that iteratively evolves agent prompts using evaluation feedback, improving agent decision accuracy and robustness.",
+        "Generated $1.3M in incremental revenue by developing an LLM-powered partner intelligence platform that analyzed usage patterns, company attributes, and industry signals to identify upsell and cross-sell opportunities.",
+        "Built a behavioral fraud detection system achieving 90% accuracy, processing millions of activity logs to identify suspicious patterns and proactively block scam accounts."
+      ]
+    },
+    {
+      "company": "Brillio Technologies",
+      "role": "Senior Data Scientist",
+      "start_date": "2021-03",
+      "end_date": "2024-01",
+      "is_current": false,
+      "responsibilities": [
+        "Increased trial-to-paid conversion by 7% by designing customer propensity models leveraging behavioral and product usage features, enabling sales teams to prioritize high-probability leads at scale.",
+        "Designed and deployed an end-to-end MLOps platform supporting 600+ production ML models."
+      ]
+    },
+    {
+      "company": "Deloitte Consulting LLP",
+      "role": "Consultant - Machine Learning",
+      "start_date": "2017-06",
+      "end_date": "2021-03",
+      "is_current": false,
+      "responsibilities": [
+        "Built end-to-end machine learning solutions across domains including credit risk modeling, demand forecasting, marketing analytics, and NLP-based text classification.",
+        "Developed predictive risk models for trade credit insurance using historical claims, sector indicators, and customer financial attributes to identify high-risk customers and industries and support underwriting decisions.",
+        "Implemented time-series forecasting models to predict sales demand and support supply chain planning."
+      ]
+    },
+    {
+      "company": "Tata Consultancy Services",
+      "role": "System Engineer - Data Analytics",
+      "start_date": "2015-03",
+      "end_date": "2017-06",
+      "is_current": false,
+      "responsibilities": [
+        "Developed and maintained ETL pipelines and data processing workflows using SQL and Java to support enterprise analytics and reporting systems.",
+        "Designing data models for data warehouse, used JAVA/SQL to store, fetch and integrate data services to downstream applications.",
+        "Worked as part of Master Data Management team to ensure Data Quality standards."
+      ]
+    }
+  ],
+  "education": [
+    {
+      "institution": "Birla Institute of Technology & Science",
+      "degree": "PhD Scholar",
+      "field_of_study": "Data Science",
+      "start_date": "2025-12",
+      "end_date": "2030-12",
+      "status": "In Progress"
+    },
+    {
+      "institution": "Birla Institute of Technology & Science",
+      "degree": "Master of Technology",
+      "field_of_study": "Data Science",
+      "start_date": "2021-03",
+      "end_date": "2023-04",
+      "status": "Completed"
+    },
+    {
+      "institution": "Visvesvaraya Technological University",
+      "degree": "Bachelor of Engineering",
+      "field_of_study": "Computer Science",
+      "start_date": "2011-08",
+      "end_date": "2014-05",
+      "status": "Completed"
+    },
+    {
+      "institution": "Karnataka Technical Education",
+      "degree": "Technical Diploma",
+      "field_of_study": "Computer Science",
+      "start_date": "2008-06",
+      "end_date": "2011-07",
+      "status": "Completed"
+    }
+  ]
+}

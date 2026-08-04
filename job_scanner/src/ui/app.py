@@ -21,16 +21,21 @@ class MarkAppliedBody(BaseModel):
     message: str = "Marked applied via UI"
 
 
-def create_app(db_path: Optional[Path] = None) -> FastAPI:
+def _build_store(db_path: Path | None) -> tuple[JobStore, Path]:
     env = EnvSettings()
     yaml_cfg = load_yaml_config()
     output_cfg = yaml_cfg.get("output", {})
     db = db_path or Path(output_cfg.get("results_dir", "output")) / "jobs.db"
-
     store = JobStore(db)
     matches_json = Path(output_cfg.get("results_dir", "output")) / "matches.json"
     if store.stats()["total"] == 0 and matches_json.exists():
         store.import_matches_json(matches_json)
+    return store, output_cfg
+
+
+def create_app(db_path: Optional[Path] = None) -> FastAPI:
+    env = EnvSettings()
+    store, output_cfg = _build_store(db_path)
 
     app = FastAPI(title="Job Scanner", version="0.2.0")
 
@@ -72,6 +77,16 @@ def create_app(db_path: Optional[Path] = None) -> FastAPI:
             return {"ok": True, "message": "Already marked as applied"}
         store.mark_manual_applied(job_id, body.message)
         return {"ok": True, "message": "Marked as applied"}
+
+    @app.post("/api/jobs/{job_id}/delete")
+    def delete_job(job_id: str):
+        job = store.get_job(job_id)
+        if not job:
+            raise HTTPException(404, "Job not found")
+        if job.get("is_deleted"):
+            return {"ok": True, "message": "Already deleted"}
+        store.soft_delete(job_id)
+        return {"ok": True, "message": "Job deleted"}
 
     @app.post("/api/jobs/{job_id}/apply")
     def apply_job(job_id: str):

@@ -12,34 +12,6 @@ from src.models import ResumeProfile
 VISION_EXTRACT_PROMPT = """Extract ALL text from these resume page images.
 Return plain text only, preserving sections (experience, education, skills)."""
 
-
-def extract_pdf_text(path: Path) -> str:
-    reader = PdfReader(str(path))
-    parts: list[str] = []
-    for page in reader.pages:
-        text = page.extract_text()
-        if text:
-            parts.append(text)
-    return "\n".join(parts).strip()
-
-
-def extract_pdf_text_vision(path: Path, llm: OllamaClient) -> str:
-    """OCR via Ollama vision when PDF has no embedded text."""
-    doc = fitz.open(str(path))
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_path = Path(tmp)
-        image_paths: list[Path] = []
-        for i, page in enumerate(doc):
-            pix = page.get_pixmap(dpi=150)
-            img_path = tmp_path / f"page_{i}.png"
-            pix.save(str(img_path))
-            image_paths.append(img_path)
-        doc.close()
-        if not image_paths:
-            return ""
-        return llm.generate_from_images(VISION_EXTRACT_PROMPT, image_paths)
-
-
 RESUME_SYSTEM = """You analyze resumes for job matching. Respond with valid JSON only, no markdown.
 Schema:
 {
@@ -48,6 +20,37 @@ Schema:
   "experience_years": number or null,
   "preferred_titles": ["title1", "title2"]
 }"""
+
+
+def extract_pdf_text(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in (".txt", ".json"):
+        return path.read_text(encoding="utf-8")
+    if suffix == ".pdf":
+        reader = PdfReader(str(path))
+        parts = [page.extract_text() for page in reader.pages]
+        return "\n".join(p for p in parts if p).strip()
+    raise ValueError(f"Unsupported file type: {suffix}")
+
+
+def extract_pdf_text_vision(path: Path, llm: OllamaClient) -> str:
+    doc = fitz.open(str(path))
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        image_paths = [
+            _page_to_image(doc, i, tmp_path) for i in range(len(doc))
+        ]
+        doc.close()
+        if not image_paths:
+            return ""
+        return llm.generate_from_images(VISION_EXTRACT_PROMPT, image_paths)
+
+
+def _page_to_image(doc: fitz.Document, page_num: int, tmp_dir: Path) -> Path:
+    pix = doc[page_num].get_pixmap(dpi=150)
+    img_path = tmp_dir / f"page_{page_num}.png"
+    pix.save(str(img_path))
+    return img_path
 
 
 def load_resume_profile(

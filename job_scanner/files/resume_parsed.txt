@@ -1,0 +1,55 @@
+Name: Basavaraj D Jakkannavar
+Phon: +91-7795671699
+Email: cse.basavaraj@gmail.com
+Address: Saraswathi Nagar, Bengaluru, 560040.
+
+Summary:
+Senior Data Scientist with 11 years of experience building large-scale machine learning systems and enterprise AI solutions across multiple industries. Proven expertise in deploying production ML systems, developing transformer-based NLP solutions, and designing scalable MLOps pipelines. Experienced in customer analytics, fraud detection, forecasting, recommendation systems, and generative AI applications. Recently focused on LLM-powered applications and agentic AI systems for enterprise automation.
+
+Skills:
+Machine Learning & AI: Machine Learning, Deep Learning, NLP, Transformer Models, Generative AI, LLM Fine-tuning, Agentic AI Systems, Recommendation Systems
+Programming: Python, SQL, Java, PySpark
+ML Frameworks: PyTorch, TensorFlow, Scikit-learn, HuggingFace
+Data Platforms: Snowflake, BigQuery, Azure Synapse, AWS Athena, S3
+MLOps & Infrastructure: Azure ML, CI/CD, Docker, Kubernetes, Model Monitoring
+Data Engineering: ETL Pipelines, Airflow, Data Warehousing, Feature Engineering, PowerBI
+
+Experience:
+Company: ConnectWise
+Start Date: Jan-2024
+Role: Senior Data Scientist
+Description: Architected a multi-agent AI system for automated ticket routing, where specialized agents predict attributes such as board, priority, contact, and company to route 2.1M+ support tickets per quarter. Developed a GEPA-based prompt optimization framework that iteratively evolves agent prompts using evaluation feedback, improving agent decision accuracy and robustness. Generated $1.3M in incremental revenue by developing an LLM-powered partner intelligence platform that analyzed usage patterns, company attributes, and industry signals to identify upsell and cross-sell opportunities. Built a behavioral fraud detection system achieving >90% accuracy, processing millions of activity logs to identify suspicious patterns and proactively block scam accounts.
+
+
+Company: Brillio Technologies
+Start Date: Mar-2021
+End Date: Jan-2024
+Role: Senior Data Scientist
+Description: Increased trial-to-paid conversion by 7% by designing customer propensity models leveraging behavioral and product usage features, enabling sales teams to prioritize high-probability leads at scale. Designed and deployed an end-to-end MLOps platform supporting 600+ production ML models.
+
+
+Company: Deloitte Consulting LLP
+Start Date: Jun-2017
+End Date: Mar-2021
+Role: Consultant - Machine Learning
+Description: Built end-to-end machine learning solutions across domains including credit risk modeling, demand forecasting, marketing analytics, and NLP-based text classification. Developed predictive risk models for trade credit insurance using historical claims, sector indicators, and customer financial attributes to identify high-risk customers and industries and support underwriting decisions. Implemented time-series forecasting models to predict sales demand and support supply chain planning.
+
+
+Company: Tata Consultancy Services
+Start Date: Mar-2015
+End Date: Jun-2017
+Role: System Engineer - Data Analytics
+Description: Developed and maintained ETL pipelines and data processing workflows using SQL and Java to support enterprise analytics and reporting systems.
+Designing data models for data warehouse, used JAVA/SQL to store, fetch and integrate data services to downstream applications.
+Worked as part of Master Data Management team to ensure Data Quality standards.
+
+Education:
+Birla Institute of Technology & Science
+[Dec 2025 to Dec 2030] - PhD Scholar (Data Science)
+[Mar 2021 to Apr 2023] - Master of Technology - Data Science 
+
+Visvesvaraya Technological University
+[Aug 2011 to May 2014] - Bachelor of Engineering - Computer Science
+
+Karnataka Technical  Education
+[Jun 2008 - Jul 2011] - Technical Diploma - Computer Science

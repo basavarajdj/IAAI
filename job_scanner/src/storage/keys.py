@@ -6,7 +6,6 @@ from src.models import Portal
 
 
 def normalize_job_key(portal: Portal | str, job_id: str, url: str) -> str:
-    """Stable primary key: portal + numeric/slug id from URL."""
     portal_val = portal.value if isinstance(portal, Portal) else str(portal)
     clean = _extract_stable_id(portal_val, job_id, url)
     return f"{portal_val}:{clean}"

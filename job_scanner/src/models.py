@@ -48,6 +48,6 @@ class ApplicationRecord(BaseModel):
     title: str
     company: str
     match_score: int
-    status: str  # dry_run | submitted | failed | skipped
+    status: str
     message: str = ""
     applied_at: datetime = Field(default_factory=datetime.utcnow)

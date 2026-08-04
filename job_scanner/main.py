@@ -18,6 +18,7 @@ from src.resume.parser import load_resume_profile
 from src.scrapers.base import scrape_jobs_sync
 from src.settings import EnvSettings, load_yaml_config, resolve_resume_path
 from src.storage.job_store import JobStore
+from src.storage.keys import normalize_job_key
 
 app = typer.Typer(help="Job scanner: LinkedIn, Naukri, Indeed + Ollama matching")
 console = Console()
@@ -25,6 +26,34 @@ console = Console()
 
 def _build_query(roles: list[str]) -> str:
     return " OR ".join(roles[:3]) if roles else "software engineer"
+
+
+def _print_top_matches(ranked: list, count: int = 15) -> None:
+    table = Table(title="Top matches")
+    table.add_column("Score", justify="right")
+    table.add_column("Portal")
+    table.add_column("Title")
+    table.add_column("Company")
+    table.add_column("Rec?")
+
+    for r in ranked[:count]:
+        table.add_row(
+            str(r.score),
+            r.job.portal.value,
+            r.job.title[:40],
+            r.job.company[:25],
+            "\u2713" if r.recommended else "",
+        )
+    console.print(table)
+
+    top = [r for r in ranked if r.recommended][:5]
+    if top:
+        console.print("\n[bold]Best fits:[/bold]")
+        for r in top:
+            console.print(f"  [{r.score}] {r.job.title} @ {r.job.company}")
+            console.print(f"      {r.job.url}")
+            if r.reasoning:
+                console.print(f"      {r.reasoning[:120]}...")
 
 
 @app.command()
@@ -59,6 +88,7 @@ def scan(
     query = _build_query(prefs.get("roles", []))
     portals = search.get("portals", ["linkedin", "naukri", "indeed"])
     max_per = min(max_jobs, search.get("max_jobs_per_portal", 25))
+    max_days_old = search.get("max_days_old", 7)
 
     resume_path = resolve_resume_path(env)
     llm = OllamaClient(env.ollama_host, env.ollama_model)
@@ -81,18 +111,47 @@ def scan(
         max_per,
         headless=use_headless,
         slow_mo_ms=env.playwright_slow_mo_ms,
+        max_days_old=max_days_old,
     )
     console.print(f"Found [green]{len(jobs)}[/green] listings")
 
     if not jobs:
         raise typer.Exit(1)
 
+    results_dir = Path(output_cfg.get("results_dir", "output"))
+    results_dir.mkdir(parents=True, exist_ok=True)
+    db_path = results_dir / "jobs.db"
+
+    store = JobStore(db_path)
+    try:
+        pre_deleted = len(jobs)
+        jobs = [j for j in jobs if not store.is_deleted(
+            normalize_job_key(j.portal, j.job_id, j.url)
+        )]
+        skipped = pre_deleted - len(jobs)
+        if skipped:
+            console.print(f"  Skipped [yellow]{skipped}[/yellow] previously deleted jobs")
+    finally:
+        store.close()
+
+    locations = prefs.get("locations", [])
+    if locations:
+        filtered = [
+            j for j in jobs
+            if any(loc.lower() in j.location.lower() for loc in locations)
+        ]
+        skipped = len(jobs) - len(filtered)
+        if skipped:
+            console.print(f"  Filtered out [yellow]{skipped}[/yellow] jobs outside target locations: {', '.join(locations)}")
+        jobs = filtered
+
+    if not jobs:
+        console.print("[red]No jobs match the location filter. Adjust preferences.locations in config.yaml[/red]")
+        raise typer.Exit(1)
+
     console.print("\n[cyan]Matching jobs with Ollama...[/cyan]")
     matcher = JobMatcher(llm, min_score=env.min_match_score)
     ranked = matcher.rank_jobs(jobs, profile, prefs)
-
-    results_dir = Path(output_cfg.get("results_dir", "output"))
-    results_dir.mkdir(parents=True, exist_ok=True)
     out_file = results_dir / "matches.json"
     with out_file.open("w", encoding="utf-8") as f:
         json.dump(
@@ -103,7 +162,6 @@ def scan(
         )
     console.print(f"Saved matches to [green]{out_file}[/green]")
 
-    db_path = results_dir / "jobs.db"
     store = JobStore(db_path)
     try:
         pks = store.save_matches(ranked)
@@ -111,31 +169,7 @@ def scan(
     finally:
         store.close()
 
-    table = Table(title="Top matches")
-    table.add_column("Score", justify="right")
-    table.add_column("Portal")
-    table.add_column("Title")
-    table.add_column("Company")
-    table.add_column("Rec?")
-
-    for r in ranked[:15]:
-        table.add_row(
-            str(r.score),
-            r.job.portal.value,
-            r.job.title[:40],
-            r.job.company[:25],
-            "✓" if r.recommended else "",
-        )
-    console.print(table)
-
-    top = [r for r in ranked if r.recommended][:5]
-    if top:
-        console.print("\n[bold]Best fits:[/bold]")
-        for r in top:
-            console.print(f"  [{r.score}] {r.job.title} @ {r.job.company}")
-            console.print(f"      {r.job.url}")
-            if r.reasoning:
-                console.print(f"      {r.reasoning[:120]}...")
+    _print_top_matches(ranked)
 
     if apply:
         log_path = Path(output_cfg.get("applications_log", "output/applications.jsonl"))
@@ -145,7 +179,7 @@ def scan(
             console.print(f"\n[cyan]Apply mode: {env.apply_mode}[/cyan]")
             records = applier.apply_matches(top, profile)
             for rec in records:
-                console.print(f"  [{rec.status}] {rec.title} — {rec.message}")
+                console.print(f"  [{rec.status}] {rec.title} \u2014 {rec.message}")
         finally:
             store.close()
 

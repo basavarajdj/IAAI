@@ -31,24 +31,48 @@ Edit `config.yaml` for default **roles** (ML engineer, data science, cybersecuri
 ## Usage
 
 ```powershell
-# Set interests via CLI or config.yaml
+# ── Preferences ───────────────────────────────────────────
+# Set interests via CLI
 python main.py set-preferences "ML Engineer,Data Science,Cybersecurity" "Healthcare,Banking,Technology"
 
-# Parse resume only (Ollama)
+# Or edit config.yaml directly (supports: roles, industries,
+# locations, keywords, exclude_keywords, exclude_companies)
+
+# ── Resume ────────────────────────────────────────────────
+# Parse resume and print profile summary (Ollama)
 python main.py parse-resume
 
-# Scan + match (saves to output/jobs.db + output/matches.json)
+# ── Scan ──────────────────────────────────────────────────
+# Basic scan with defaults from config.yaml
+python main.py scan
+
+# Scan with custom roles, industries, location, and limit
 python main.py scan --roles "Data Scientist,ML Engineer" --industries "Healthcare,Banking" -l India -n 10
 
-# Web UI — browse jobs, descriptions, applied status
-python main.py ui
-# Open http://127.0.0.1:8080
-
-# Scan and run apply step (dry_run unless APPLY_MODE changed)
+# Scan + run apply step (respects APPLY_MODE in .env)
 python main.py scan --apply
 
-# Visible browser (login / CAPTCHA)
+# Visible browser (for login / CAPTCHA)
 python main.py scan --no-headless -n 5
+
+# Headless mode (default, explicit)
+python main.py scan --headless
+
+# ── Web UI ────────────────────────────────────────────────
+# Launch browser UI on default port 8080
+python main.py ui
+
+# Custom host and port
+python main.py ui --host 0.0.0.0 --port 8081
+
+# Auto-reload on code changes (development)
+python main.py ui --reload
+
+# ── Help ──────────────────────────────────────────────────
+python main.py --help
+python main.py scan --help
+python main.py ui --help
+python main.py set-preferences --help
 ```
 
 ### Apply modes (`.env`)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from playwright.async_api import Browser, async_playwright
+from playwright.async_api import async_playwright
 
 from src.models import JobListing, Portal
 
@@ -28,6 +28,7 @@ async def scrape_all_portals(
     headless: bool = True,
     slow_mo_ms: int = 100,
     fetch_descriptions: bool = True,
+    max_days_old: int = 7,
 ) -> list[JobListing]:
     enabled = []
     for name in portals:
@@ -37,17 +38,14 @@ async def scrape_all_portals(
             continue
 
     jobs: list[JobListing] = []
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=headless,
-            slow_mo=slow_mo_ms,
-        )
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=headless, slow_mo=slow_mo_ms)
         try:
             for portal in enabled:
                 scraper = SCRAPERS.get(portal)
                 if not scraper:
                     continue
-                batch = await scraper(browser, query, location, max_per_portal)
+                batch = await scraper(browser, query, location, max_per_portal, max_days_old=max_days_old)
                 jobs.extend(batch)
             if fetch_descriptions and jobs:
                 await fetch_all_descriptions(browser, jobs)

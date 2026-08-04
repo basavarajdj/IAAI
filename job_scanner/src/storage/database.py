@@ -43,5 +43,12 @@ def get_connection(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    if "deleted_at" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN deleted_at TEXT DEFAULT NULL")

@@ -2,19 +2,15 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from src.models import ApplicationRecord, JobListing, MatchResult, Portal
 from src.storage.database import get_connection
 from src.storage.keys import normalize_job_key
+from src.utils import serialize_dt, utcnow
 
 APPLIED_STATUSES = frozenset({"submitted", "assisted", "manual"})
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 class JobStore:
@@ -25,12 +21,46 @@ class JobStore:
     def close(self) -> None:
         self.conn.close()
 
-    def upsert_match(self, match: MatchResult) -> str:
+    def _upsert_job_values(self, match: MatchResult, now: str) -> tuple:
         job = match.job
-        pk = normalize_job_key(job.portal, job.job_id, job.url)
-        now = _now()
-        scraped = job.scraped_at.isoformat() if hasattr(job.scraped_at, "isoformat") else str(job.scraped_at)
+        return (
+            normalize_job_key(job.portal, job.job_id, job.url),
+            job.portal.value,
+            job.job_id,
+            job.title,
+            job.company,
+            job.location,
+            job.url,
+            job.description,
+            job.posted,
+            serialize_dt(job.scraped_at),
+            match.score,
+            match.reasoning,
+            json.dumps(match.skill_overlap),
+            json.dumps(match.gaps),
+            1 if match.recommended else 0,
+            now,
+            now,
+        )
 
+    def _upsert_listing_values(self, job: JobListing, now: str) -> tuple:
+        return (
+            normalize_job_key(job.portal, job.job_id, job.url),
+            job.portal.value,
+            job.job_id,
+            job.title,
+            job.company,
+            job.location,
+            job.url,
+            job.description,
+            job.posted,
+            serialize_dt(job.scraped_at),
+            now,
+            now,
+        )
+
+    def upsert_match(self, match: MatchResult) -> str:
+        pk, now = normalize_job_key(match.job.portal, match.job.job_id, match.job.url), utcnow()
         self.conn.execute(
             """
             INSERT INTO jobs (
@@ -54,34 +84,13 @@ class JobStore:
                 recommended = excluded.recommended,
                 updated_at = excluded.updated_at
             """,
-            (
-                pk,
-                job.portal.value,
-                job.job_id,
-                job.title,
-                job.company,
-                job.location,
-                job.url,
-                job.description,
-                job.posted,
-                scraped,
-                match.score,
-                match.reasoning,
-                json.dumps(match.skill_overlap),
-                json.dumps(match.gaps),
-                1 if match.recommended else 0,
-                now,
-                now,
-            ),
+            self._upsert_job_values(match, now),
         )
         self.conn.commit()
         return pk
 
     def upsert_job_listing(self, job: JobListing) -> str:
-        pk = normalize_job_key(job.portal, job.job_id, job.url)
-        now = _now()
-        scraped = job.scraped_at.isoformat() if hasattr(job.scraped_at, "isoformat") else str(job.scraped_at)
-
+        pk, now = normalize_job_key(job.portal, job.job_id, job.url), utcnow()
         self.conn.execute(
             """
             INSERT INTO jobs (
@@ -99,23 +108,24 @@ class JobStore:
                 scraped_at = excluded.scraped_at,
                 updated_at = excluded.updated_at
             """,
-            (
-                pk,
-                job.portal.value,
-                job.job_id,
-                job.title,
-                job.company,
-                job.location,
-                job.url,
-                job.description,
-                job.posted,
-                scraped,
-                now,
-                now,
-            ),
+            self._upsert_listing_values(job, now),
         )
         self.conn.commit()
         return pk
+
+    def soft_delete(self, job_pk: str) -> None:
+        self.conn.execute(
+            "UPDATE jobs SET deleted_at = ?, updated_at = ? WHERE id = ?",
+            (utcnow(), utcnow(), job_pk),
+        )
+        self.conn.commit()
+
+    def is_deleted(self, job_pk: str) -> bool:
+        row = self.conn.execute(
+            "SELECT deleted_at FROM jobs WHERE id = ?",
+            (job_pk,),
+        ).fetchone()
+        return row is not None and row["deleted_at"] is not None
 
     def save_matches(self, matches: list[MatchResult]) -> list[str]:
         return [self.upsert_match(m) for m in matches]
@@ -123,7 +133,7 @@ class JobStore:
     def update_description(self, job_pk: str, description: str) -> None:
         self.conn.execute(
             "UPDATE jobs SET description = ?, updated_at = ? WHERE id = ?",
-            (description, _now(), job_pk),
+            (description, utcnow(), job_pk),
         )
         self.conn.commit()
 
@@ -151,14 +161,7 @@ class JobStore:
                 message = excluded.message,
                 applied_at = excluded.applied_at
             """,
-            (
-                job_pk,
-                record.status,
-                record.message,
-                record.applied_at.isoformat()
-                if hasattr(record.applied_at, "isoformat")
-                else str(record.applied_at),
-            ),
+            (job_pk, record.status, record.message, serialize_dt(record.applied_at)),
         )
         self.conn.commit()
 
@@ -183,9 +186,13 @@ class JobStore:
         search: str = "",
         limit: int = 200,
         offset: int = 0,
+        include_deleted: bool = False,
     ) -> list[dict[str, Any]]:
         clauses = ["j.match_score >= ?"]
         params: list[Any] = [min_score]
+
+        if not include_deleted:
+            clauses.append("j.deleted_at IS NULL")
 
         if portal:
             clauses.append("j.portal = ?")
@@ -230,21 +237,24 @@ class JobStore:
         return self._row_to_job_dict(row) if row else None
 
     def stats(self) -> dict[str, int]:
-        total = self.conn.execute("SELECT COUNT(*) AS c FROM jobs").fetchone()["c"]
+        total = self.conn.execute("SELECT COUNT(*) AS c FROM jobs WHERE deleted_at IS NULL").fetchone()["c"]
+        deleted = self.conn.execute("SELECT COUNT(*) AS c FROM jobs WHERE deleted_at IS NOT NULL").fetchone()["c"]
         applied = self.conn.execute(
             """
-            SELECT COUNT(*) AS c FROM applications
-            WHERE status IN ('submitted','assisted','manual')
+            SELECT COUNT(*) AS c FROM applications a
+            JOIN jobs j ON j.id = a.job_pk
+            WHERE a.status IN ('submitted','assisted','manual') AND j.deleted_at IS NULL
             """
         ).fetchone()["c"]
         recommended = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM jobs WHERE recommended = 1"
+            "SELECT COUNT(*) AS c FROM jobs WHERE recommended = 1 AND deleted_at IS NULL"
         ).fetchone()["c"]
         with_desc = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM jobs WHERE length(description) > 50"
+            "SELECT COUNT(*) AS c FROM jobs WHERE length(description) > 50 AND deleted_at IS NULL"
         ).fetchone()["c"]
         return {
             "total": total,
+            "deleted": deleted,
             "applied": applied,
             "recommended": recommended,
             "with_description": with_desc,
@@ -293,11 +303,13 @@ class JobStore:
             recommended=bool(row["recommended"]),
         )
 
-    def _row_to_job_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+    @staticmethod
+    def _row_to_job_dict(row: sqlite3.Row) -> dict[str, Any]:
         d = dict(row)
         d["skill_overlap"] = json.loads(d.get("skill_overlap") or "[]")
         d["gaps"] = json.loads(d.get("gaps") or "[]")
         d["recommended"] = bool(d.get("recommended"))
         d["is_applied"] = d.get("apply_status") in APPLIED_STATUSES
         d["has_description"] = len(d.get("description") or "") > 50
+        d["is_deleted"] = d.get("deleted_at") is not None
         return d

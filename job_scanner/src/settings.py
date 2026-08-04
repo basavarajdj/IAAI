@@ -19,9 +19,9 @@ class EnvSettings(BaseSettings):
 
     ollama_host: str = "http://127.0.0.1:11434"
     ollama_model: str = "gemma4:e2b"
-    resume_path: str = "files/Resume_Basavaraj_Jakkannavar_v1.pdf"
+    resume_path: str = "files/resume_parsed.txt"
     min_match_score: int = 70
-    apply_mode: str = "dry_run"  # dry_run | assisted | auto
+    apply_mode: str = "auto"
     linkedin_email: str = ""
     linkedin_password: str = ""
     naukri_email: str = ""
