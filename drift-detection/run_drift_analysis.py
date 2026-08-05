@@ -114,27 +114,40 @@ REF_SAMPLE_SIZE = 20_000
 # rerunning the pipeline.
 METHOD_THRESHOLDS = {
     # Significance AND a practical effect size — see drift_engine.ks_test.
-    'ks_stats': {'alpha': 0.05, 'min_effect': 0.10, 'fdr': True, 'min_feature_fraction': 0.6},
+    # min_feature_fraction lowered from 0.6 to 0.3 (6 of 20 features): a
+    # supermajority-of-features consensus is appropriate for PSI (folklore
+    # bands calibrated per-feature, no persistence-tested gate above them),
+    # but for KS/JS/SHAP it meant a single genuinely drifting feature was
+    # worth nothing until eleven others agreed — a bar high enough that the
+    # method-level pros/cons discussion (§3.2) treated "never confirms" as
+    # close to guaranteed regardless of what the data does. 0.3 keeps the
+    # persistence gate (2 consecutive weeks) as the actual noise filter,
+    # rather than doubling up two conservative gates on the same signal.
+    'ks_stats': {'alpha': 0.05, 'min_effect': 0.10, 'fdr': True, 'min_feature_fraction': 0.3},
     # Folklore band AND the bootstrap null calibrated to this window's size.
     'psi': {'warning': 0.10, 'drift': 0.20, 'null_quantile': 0.99, 'min_feature_fraction': 0.6},
     # Decision statistic is Jensen-Shannon distance (bounded, symmetric);
     # raw KL is still reported for continuity with the earlier reports.
     'kl_divergence': {'js_drift': 0.10, 'js_warning': 0.05, 'kl_drift': 0.50,
-                      'min_feature_fraction': 0.6},
+                      'min_feature_fraction': 0.3},
     'ddm': {'warning_level': 2.0, 'drift_level': 3.0, 'error_signal': 'balanced'},
     'eddm': {'beta_warning': 0.85, 'beta_drift': 0.75, 'min_errors': 100,
              'error_signal': 'balanced'},
     'adwin': {'delta': 0.002},
     'hddm': {'drift_confidence': 0.001, 'warning_confidence': 0.005,
              'error_signal': 'balanced'},
-    'shap': {'alpha': 0.05, 'min_effect': 0.10, 'fdr': True, 'min_feature_fraction': 0.6},
+    'shap': {'alpha': 0.05, 'min_effect': 0.10, 'fdr': True, 'min_feature_fraction': 0.3},
     'clustering': {'distance_ratio': 1.5, 'cluster_psi': 0.20},
     'autoencoder': {'z_score': 3.0},
     'prequential_auc': {'min_drop': 0.02, 'n_sigma': 2.0},
     'champion_vs_challenger': {'auc_degradation': 0.05, 'auc_gap': 0.03, 'oof': True},
 }
 
-MIN_FEATURE_DRIFT_FRACTION = 0.6
+# Per-method feature-vote consensus fraction, read from METHOD_THRESHOLDS so
+# there is exactly one place each method's bar is set (previously a single
+# global 0.6 silently overrode the per-method values above, which were dead
+# config — see the commit that fixed this).
+FEATURE_VOTE_FRACTION = {m: METHOD_THRESHOLDS[m]['min_feature_fraction'] for m in FEATURE_VOTE_METHODS}
 
 # Persistence gate: fire in k of the last n windows before retraining.
 CONFIRM_K, CONFIRM_N = 2, 2
@@ -500,17 +513,16 @@ def _assemble_drift_flags(ks_results, psi_results, kl_results, stream_res,
     than one underlying signal counted several times.
     """
     n = max(len(top_features), 1)
-    frac = MIN_FEATURE_DRIFT_FRACTION
 
     raw_flags = {
-        'ks_stats': bool(sum(r['drift'] for r in ks_results.values()) / n >= frac),
-        'psi': bool(sum(r['drift'] for r in psi_results.values()) / n >= frac),
-        'kl_divergence': bool(sum(r['drift'] for r in kl_results.values()) / n >= frac),
+        'ks_stats': bool(sum(r['drift'] for r in ks_results.values()) / n >= FEATURE_VOTE_FRACTION['ks_stats']),
+        'psi': bool(sum(r['drift'] for r in psi_results.values()) / n >= FEATURE_VOTE_FRACTION['psi']),
+        'kl_divergence': bool(sum(r['drift'] for r in kl_results.values()) / n >= FEATURE_VOTE_FRACTION['kl_divergence']),
         'ddm': bool(stream_res['ddm']['drift_detected']),
         'eddm': bool(stream_res['eddm']['drift_detected']),
         'adwin': bool(stream_res['adwin']['drift_detected']),
         'hddm': bool(stream_res['hddm']['drift_detected']),
-        'shap': bool(shap_res.get('drifted_features_count', 0) / n >= frac),
+        'shap': bool(shap_res.get('drifted_features_count', 0) / n >= FEATURE_VOTE_FRACTION['shap']),
         'clustering': bool(clustering_res['drift_detected']),
         'autoencoder': bool(ae_res['drift_detected']),
         'prequential_auc': bool(stream_res['prequential_auc']['drift_detected']),
@@ -597,11 +609,12 @@ def _build_reasons(drifted_methods, top_features, ks_results, psi_results, kl_re
     n = max(len(top_features), 1)
     reasons = {}
 
-    def _vote(results, key, label):
+    def _vote(results, key, label, method_name):
         drifted = [f for f in top_features if results[f]['drift']]
         pct = 100 * len(drifted) / n
+        frac_pct = FEATURE_VOTE_FRACTION[method_name]
         return (f"{len(drifted)}/{len(top_features)} monitored features ({pct:.0f}%) show "
-                f"{label} — at or above the {MIN_FEATURE_DRIFT_FRACTION:.0%} consensus "
+                f"{label} — at or above the {frac_pct:.0%} consensus "
                 f"threshold: {drifted}"), {
             'drifted_features': drifted, 'drifted_count': len(drifted),
             'drifted_fraction': len(drifted) / n,
@@ -610,16 +623,17 @@ def _build_reasons(drifted_methods, top_features, ks_results, psi_results, kl_re
 
     for mn in drifted_methods:
         if mn == 'ks_stats':
-            reason, metrics = _vote(ks_results, 'stat', 'KS drift (FDR-corrected, D>=min_effect)')
+            reason, metrics = _vote(ks_results, 'stat', 'KS drift (FDR-corrected, D>=min_effect)', mn)
         elif mn == 'psi':
-            reason, metrics = _vote(psi_results, 'psi', 'PSI drift (>=0.20 and above the bootstrap null)')
+            reason, metrics = _vote(psi_results, 'psi', 'PSI drift (>=0.20 and above the bootstrap null)', mn)
         elif mn == 'kl_divergence':
-            reason, metrics = _vote(kl_results, 'js_distance', 'Jensen-Shannon distance drift')
+            reason, metrics = _vote(kl_results, 'js_distance', 'Jensen-Shannon distance drift', mn)
         elif mn == 'shap':
             fsd = shap_res.get('feature_shap_drift', {})
             drifted = [f for f in top_features if fsd.get(f, {}).get('is_drift')]
             reason = (f"{len(drifted)}/{len(top_features)} monitored features "
-                      f"({100 * len(drifted) / n:.0f}%) show SHAP-attribution drift: {drifted}")
+                      f"({100 * len(drifted) / n:.0f}%) show SHAP-attribution drift — at or above "
+                      f"the {FEATURE_VOTE_FRACTION['shap']:.0%} consensus threshold: {drifted}")
             metrics = {'drifted_features': drifted, 'drifted_count': len(drifted)}
         elif mn == 'ddm':
             r = stream_res['ddm']

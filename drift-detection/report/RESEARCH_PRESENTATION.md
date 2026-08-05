@@ -12,12 +12,21 @@ paper), [FEATURE_ENGINEERING_AND_MODELING.md](FEATURE_ENGINEERING_AND_MODELING.m
 [FEATURE_SELECTION_PROCESS.md](FEATURE_SELECTION_PROCESS.md),
 [DRIFT_ANALYSIS_EXPLAINED.md](DRIFT_ANALYSIS_EXPLAINED.md).
 
-**Last full rerun: 2026-08-04.** The classical drift-detection pipeline and
-the RL experiment were both re-executed end to end on that date; every number
-and chart below reflects that run. The pipeline is deterministic on fixed
-input data (no random seeds vary run to run), so this rerun reproduced every
-figure already in this document to at least four decimal places — see
-"Reproducing this report" below for the exact commands.
+**Last full rerun: 2026-08-05.** The classical drift-detection pipeline and
+the RL experiment were both re-executed end to end on that date, with two
+substantive changes from the prior rerun (2026-08-04): the KS, Jensen-Shannon,
+and SHAP feature-vote consensus threshold was lowered from 0.60 to 0.30 (§3.1),
+and the clustering/autoencoder detectors now report per-cluster record counts
+and per-feature contribution breakdowns (§3.3.11, §3.3.12) in addition to
+their drift decisions. Every number and chart below reflects this run. The
+classical drift pipeline (§1-3) reproduced its unaffected numbers (DDM, HDDM,
+PSI, Clustering, Autoencoder) exactly — it is deterministic on fixed input
+data. The RL experiment (§4-5) is the one exception this rerun: its top-line
+benchmark numbers (§5.2, §5.3) reproduced exactly, but the §5.4 ablation
+result changed between the two most recent reruns despite no direct code path
+connecting it to the threshold change above — see §5.4 for the honest account
+of what did and didn't reproduce, and why we can't fully isolate the cause.
+See "Reproducing this report" below for the exact commands.
 
 ---
 
@@ -306,6 +315,80 @@ makes its cost *measurable* (Section 5).
 >   as a modelling one — worth mentioning if the audience cares about
 >   production feasibility, not just accuracy numbers.
 
+### 2.3 Two separate models, two separate retraining mechanisms — read this before Sections 3 and 5
+
+This is the single most common point of confusion in the whole project, so it
+gets stated plainly, once, before either experiment: **Section 3's 12
+classical detectors and Section 5's RL agent do not share a model.** They are
+two independent experiments run over the same 14-week data stream, sharing
+only the frozen feature representation (§1.3) and, in the RL agent's case,
+those same 12 detectors' *outputs* as observations — never their retraining
+decisions.
+
+```mermaid
+flowchart TD
+    subgraph A["Track A — Section 3: 12 classical detectors"]
+        direction TB
+        A1["Shared LightGBM registry (§2.1)
+        one booster, all 12 detectors point at it"] --> A2["A detector confirms drift"]
+        A2 --> A3["registry.get_or_train():
+        fit a BRAND-NEW booster from scratch
+        on all cumulative data"]
+        A3 --> A4["Every detector that confirmed
+        this week adopts the identical
+        new booster"]
+    end
+    subgraph B["Track B — Sections 4-5: RL agent"]
+        direction TB
+        B1["Separate neural net (§2.2)
+        precomputed into the model lattice"] --> B2["Agent chooses an action"]
+        B2 --> B3["Full retrain: fresh NeuralFraudModel
+        trained from scratch"]
+        B2 --> B4["Partial update: CLONE the last full
+        model, fine-tune a few epochs on
+        the recent 4 weeks"]
+        B2 --> B5["Hedge: blend prediction
+        PROBABILITIES with the frozen
+        baseline net — no training at all"]
+    end
+    A -.no path between A and B.-> B
+```
+
+**Why the LightGBM side only ever has one lever.** A gradient-boosted forest
+has no principled partial-fit — you cannot "nudge" a fixed set of trees toward
+recent data the way you can take a few gradient steps on a neural net's
+weights. So every one of Section 3's 12 detectors, when it retrains, does the
+same thing: `ModelRegistry.get_or_train()` fits an entirely new LightGBM
+booster on every row seen so far (reference window plus every week up to and
+including this one) and every detector that confirmed drift *that week*
+shares the identical resulting object (§2.1's "at most one model per week"
+design). There is no cheaper option and no concept of "how much" to retrain —
+it is binary, every time.
+
+**Why the neural side has three levers, and what each one actually changes.**
+The RL agent's neural net (`neural_model.NeuralFraudModel`, the 3-layer MLP
+from §2.2) supports three genuinely different operations, all implemented in
+`model_lattice.py` and `neural_model.py`:
+
+| Action | What actually happens to the weights |
+|---|---|
+| **Full retrain** | A brand-new `NeuralFraudModel` is trained from scratch (`.fit()`) — fresh weight initialisation, full 30-epoch training run with early stopping, on all cumulative data. Exactly as expensive as the LightGBM retrain, conceptually. |
+| **Partial update** | The **existing** model object is cloned (`.clone()` — a deep copy of the network, not a new one) and that copy's weights are fine-tuned for 5 epochs at **one-tenth the base learning rate**, on only the **last 4 weeks** of data. The input standardisation (mean/std) is *not* refit — it stays frozen from whenever the parent model was last fully trained, for the same reason the feature encoders are frozen (§1.3): refitting it would make the update partly a representation change in disguise. This always branches from the last **full** model, never chains from a previous partial update (§4.3) — bounding how far repeated fine-tuning can drift from a properly-trained baseline. |
+| **Hedge ensemble** | No training happens at all. The agent's current (adapted) model and the frozen original baseline model each produce a fraud probability for every row, and those two probability vectors are blended by a weight `α ∈ {0, 0.25, 0.5, 0.75, 1.0}` (§5's model lattice enumerates all five). This is why hedging is free — it costs one extra forward pass, not a training run. |
+
+**The consequence worth remembering when reading Sections 3 and 5 side by
+side:** a confirmed alarm from, say, Champion vs Challenger in §3.3.10 has
+*zero effect* on the neural model or the RL agent's environment, and the RL
+agent choosing "full retrain" in §5 has *zero effect* on the LightGBM
+registry or any of the 12 classical detectors' pointers. This is also why the
+**never-retrain baseline AUC is different in the two sections** — 0.8725 for
+the LightGBM baseline in §3.5, 0.8523 for the neural-net baseline in §5.2 —
+that is not an inconsistency to reconcile; it is two different models'
+out-of-the-box performance on the same data. Only *within-section*
+comparisons are apples-to-apples (classical policy vs. classical policy in
+§3.5; RL policy vs. neural-model baselines in §5.2) — the two sections should
+never be read as one continuous leaderboard.
+
 ---
 
 ## 3. Drift Detection Methods — Pros, Cons, and Results
@@ -336,45 +419,64 @@ one-off blip doesn't cause action.
 
 ### 3.1 Which detectors actually fired
 
+**Consensus thresholds (a note before the numbers below).** The four
+feature-vote detectors (KS, PSI, Jensen-Shannon, SHAP) each require a
+supermajority of the 20 monitored features to individually cross their own
+per-feature test before the *method* counts the week as drifted. That
+supermajority bar is **0.30 (6 of 20 features) for KS, Jensen-Shannon, and
+SHAP**, and **0.60 (12 of 20 features) for PSI** — PSI keeps the stricter bar
+because its per-feature test has no persistence-tested significance gate
+above the folklore band the way KS's FDR correction and SHAP's effect-size
+floor do (§3.2's table). This is a deliberate, asymmetric choice, not an
+oversight: identical bars for all four would either make PSI trigger-happy or
+make the other three too conservative to ever register a real signal, given
+how differently each test's per-feature "drift" flag behaves.
+
 ![Confirmed alarms per detector, out of 14 weeks](visuals/03_confirmed_alarms_per_detector.png)
 
-**Only 4 of the 12 detectors ever confirmed drift.** KS, PSI, Jensen-Shannon,
-DDM, HDDM, SHAP, Clustering, and Autoencoder stayed silent for the entire
-14-week replay.
+**6 of the 12 detectors confirmed drift at least once.** PSI, DDM, HDDM,
+SHAP, Clustering, and Autoencoder stayed silent for the entire 14-week
+replay; KS, Jensen-Shannon, EDDM, ADWIN, Prequential AUC, and Champion vs
+Challenger all confirmed at least once.
 
 The full week-by-week picture, every detector, every week:
 
 ![Heatmap of every detector's raw and confirmed alarm state, by week](visuals/05_method_week_heatmap.png)
 
-**The headline finding: this is concept drift, not covariate shift.** Every
-detector that looks only at *feature distributions* stayed silent, while
-every detector that watches the *model's behaviour* (error rate, ranking
-quality, prediction stream) fired repeatedly. In plain terms: the
-transactions in week 9 look statistically like the transactions in the
-reference window — same distributions of amount, product, device, etc. — but
-*what makes a transaction fraudulent* changed. A production system that only
-monitors input distributions (the most common setup, because it needs no
-labels) would have shown a flat, reassuring dashboard for six months while
-the model quietly decayed.
+**The headline finding is more nuanced than a clean "distributional vs.
+behavioural" split.** At the 0.30 bar, Jensen-Shannon — a *distributional*
+detector — is now one of the most persistent alarms in the whole table (6
+confirmations, matching Prequential AUC), and KS confirms once. Both are
+driven almost entirely by the same small set of features (§3.4): a
+seasonally-unrepresentative reference window and a genuine feature-engineering
+artifact, not a broad population shift. So the more accurate statement is:
+**every feature-vote detector's confirmed alarms trace back to 2-3 specific
+features, not a general covariate shift** — PSI and SHAP simply have bars
+those same features don't clear, while KS and Jensen-Shannon's lower bar lets
+a handful of persistently-drifting features carry the whole method. Every
+detector that watches the *model's behaviour* directly (EDDM, ADWIN,
+Prequential AUC, Champion vs Challenger) also fired — those signals are real
+regardless of the feature-vote threshold, and the model's declining
+performance (visible in §3.3.9's and §3.3.10's charts) is not something any
+threshold choice can argue away.
 
 ### 3.2 Method-by-method: pros, cons, and what actually happened here
 
-The four detectors that vote across the monitored feature set (KS, PSI,
-Jensen-Shannon, SHAP) never come close to their own 0.60 consensus line, in
-any week:
+Three of the four feature-vote detectors now cross their consensus line at
+least once — only PSI, at the stricter 0.60 bar, never does:
 
-![Weekly trend of the four feature-vote detectors against their consensus threshold](visuals/04_feature_vote_weekly_trend.png)
+![Weekly trend of the four feature-vote detectors against their consensus thresholds](visuals/04_feature_vote_weekly_trend.png)
 
 | Detector | Best at | Blind to / fails when | Result on this stream |
 |---|---|---|---|
-| **KS test** | Abrupt shift in a continuous feature | Concept drift entirely; over-sensitive at large sample sizes (flagged 14/14 weeks before we fixed the sample-size artifact) | **0/14 weeks.** Feature-crossing fraction stayed at 0.15–0.45, never near the 0.60 consensus line |
-| **PSI** | Gradual population shift, interpretable magnitude | Concept drift; its 0.10/0.20 folklore bands assume an unstated sample size | **0/14 weeks.** Lowest fraction of the three distributional tests every week |
-| **Jensen-Shannon** | Same job as PSI/KL, but bounded and symmetric | Concept drift | **0/14 weeks.** Closest of the three to the line (0.50 at week 12) but never crosses |
+| **KS test** | Abrupt shift in a continuous feature | Concept drift entirely; over-sensitive at large sample sizes (flagged 14/14 weeks before we fixed the sample-size artifact) | **1/14 weeks confirmed** (week 2). Feature-crossing fraction ranged 0.15–0.35 against a 0.30 consensus — mostly below it, occasionally at or just over |
+| **PSI** | Gradual population shift, interpretable magnitude | Concept drift; its 0.10/0.20 folklore bands assume an unstated sample size | **0/14 weeks.** Lowest fraction of the three distributional tests every week, and kept at the stricter 0.60 bar (§3.1) |
+| **Jensen-Shannon** | Same job as PSI/KL, but bounded and symmetric | Concept drift | **6/14 weeks confirmed** (2, 4, 6, 8, 10, 13) — tied with Prequential AUC for the most confirmations of any detector this run, once its consensus bar dropped to 0.30 |
 | **DDM** | Abrupt degradation on balanced problems | Hides degradation in the majority class; harder to trigger the longer a model is stable — backwards from what you want | **0/14 weeks confirmed.** |
-| **EDDM** | Gradual degradation, earliest warning | Very noise-sensitive at default settings (13/14 weeks before correction) | **4/14 weeks confirmed** (2, 10, 12, 14) — the most retrain-happy detector this run |
+| **EDDM** | Gradual degradation, earliest warning | Very noise-sensitive at default settings (13/14 weeks before correction) | **4/14 weeks confirmed** (2, 10, 12, 14) |
 | **HDDM** | Staying sensitive on long-stable models; distribution-free guarantee | Conservative by design | **0/14 weeks, and 0 even at the raw-alarm level** — the only detector that never once triggered, in any version of this experiment |
 | **ADWIN** | Mean shift in the prediction stream, formal guarantee | Fires on turbulence, which isn't the same as staleness | **12/14 raw alarms, 5/14 confirmed** — as a *retraining policy* this is worse than randomly-timed retraining at equal cost |
-| **SHAP / attribution** | The *only* label-free signal with real reach into concept drift — sees what the model relies on shifting | Expensive; blind to drift that doesn't change attributions | **0/14 weeks** at the (corrected) 20-feature set — an earlier, smaller, more redundant monitoring set had produced one confirmed alarm that turned out to be substantially a redundancy artifact |
+| **SHAP / attribution** | The *only* label-free signal with real reach into concept drift — sees what the model relies on shifting | Expensive; blind to drift that doesn't change attributions | **0/14 weeks confirmed** even at the lowered 0.30 bar — one raw alarm (week 14) that never repeats. §3.3.4's chart shows why: the largest mean SHAP importance shift is two orders of magnitude below the level that would move the vote |
 | **Clustering** | Multivariate shifts no single-feature test can see | Needs standardisation or the largest-scale feature dominates | **0/14 confirmed**, but its one raw alarm (week 12) is the largest reading in its own table by a wide margin — corroborated independently by the autoencoder and by a raw feature outlier the same week |
 | **Autoencoder** | Genuinely novel regions of feature space | Reconstruction-error tests over-trigger without an effect-size floor | **0/14 weeks**, but its reconstruction error also peaks sharply at week 12 — the same event Clustering flags |
 | **Prequential AUC** | Measures what actually matters, directly | Strictly reactive — can't fire until damage is already visible | **12/14 raw, 6/14 confirmed** — the most persistence-confirmed alarms of any detector, but retrains 6 times for a worse mean AUC than the best 2-retrain policy |
@@ -402,34 +504,46 @@ this section.
 
 Votes across the 20 monitored features; a week "confirms" only if the
 fraction crossing an individually significant, effect-size-gated KS test
-reaches the 0.60 consensus line (chart already shown in §3.2, reproduced here
-for this detector alone is unnecessary — the trend for all four vote-based
-detectors is in [the shared chart](visuals/04_feature_vote_weekly_trend.png)).
+reaches its consensus line — **0.30 (6 of 20 features)**, the lowered bar
+from §3.1 (chart already shown in §3.2, reproduced here for this detector
+alone is unnecessary — the trend for all four vote-based detectors is in
+[the shared chart](visuals/04_feature_vote_weekly_trend.png)).
 
-| Week | Features crossed | Fraction | vs. 0.60 consensus | Raw alarm | Confirmed |
+| Week | Features crossed | Fraction | vs. 0.30 consensus | Raw alarm | Confirmed |
 |---|---|---|---|---|---|
-| 1 | 6/20 | 0.30 | -0.30 | No | No |
-| 2 | 7/20 | 0.35 | -0.25 | No | No |
-| 3 | 4/20 | 0.20 | -0.40 | No | No |
-| 4 | 3/20 | 0.15 | -0.45 | No | No |
-| 5 | 7/20 | 0.35 | -0.25 | No | No |
-| 6 | 6/20 | 0.30 | -0.30 | No | No |
-| 7 | 6/20 | 0.30 | -0.30 | No | No |
-| 8 | 6/20 | 0.30 | -0.30 | No | No |
-| 9 | 7/20 | 0.35 | -0.25 | No | No |
-| 10 | 7/20 | 0.35 | -0.25 | No | No |
-| 11 | 4/20 | 0.20 | -0.40 | No | No |
-| 12 | 8/20 | 0.40 | -0.20 | No | No |
-| 13 | 8/20 | 0.40 | -0.20 | No | No |
-| 14 | 9/20 | 0.45 | -0.15 | No | No |
+| 1 | 6/20 | 0.30 | +0.00 | Yes | No |
+| 2 | 7/20 | 0.35 | +0.05 | Yes | **Yes** |
+| 3 | 3/20 | 0.15 | -0.15 | No | No |
+| 4 | 3/20 | 0.15 | -0.15 | No | No |
+| 5 | 4/20 | 0.20 | -0.10 | No | No |
+| 6 | 3/20 | 0.15 | -0.15 | No | No |
+| 7 | 3/20 | 0.15 | -0.15 | No | No |
+| 8 | 3/20 | 0.15 | -0.15 | No | No |
+| 9 | 5/20 | 0.25 | -0.05 | No | No |
+| 10 | 4/20 | 0.20 | -0.10 | No | No |
+| 11 | 3/20 | 0.15 | -0.15 | No | No |
+| 12 | 5/20 | 0.25 | -0.05 | No | No |
+| 13 | 5/20 | 0.25 | -0.05 | No | No |
+| 14 | 7/20 | 0.35 | +0.05 | Yes | No |
 
-**Why it never fired.** KS tests a feature's *marginal* distribution — is
-`TransactionAmt` shaped the same way this week as in the reference window?
-Concept drift (§3.1) doesn't move marginals; it moves the *relationship*
-between features and the label, which KS cannot see by construction. The
-fraction crossing threshold drifts up slowly over the replay (0.30 → 0.45,
-consistent with §3.4's seasonal-step finding) but never gets past roughly
-three-quarters of the way to consensus.
+**Which features carry it, and why it only confirms once.** KS tests a
+feature's *marginal* distribution — is `TransactionAmt` shaped the same way
+this week as in the reference window? Concept drift (§3.1) doesn't move
+marginals; it moves the *relationship* between features and the label, which
+KS cannot see by construction. So the six features it does flag matter more
+than the count:
+
+![Top individually-drifting features, by detector](visuals/22_per_method_top_features.png)
+
+KS's own panel above shows the same three features crossing in **all 14
+weeks**: the match-flag missingness pattern and both Vesta PCA components —
+the exact three flagged as a one-time, seasonally-driven step in §3.4, not
+progressive drift. Everything past those three is occasional and
+low-frequency (`Days since prior event 15` in 5/14 weeks, the rest in 4 or
+fewer). Week 1's and week 2's extra features are enough to clear 0.30 twice
+in a row and confirm; from week 3 onward the fraction retreats to 0.15–0.25
+and stays there, occasionally spiking (week 14) without a second consecutive
+week to confirm again.
 
 #### 3.3.2 PSI (distributional, label-free)
 
@@ -450,84 +564,126 @@ three-quarters of the way to consensus.
 | 13 | 4/20 | 0.20 | -0.40 | No | No |
 | 14 | 4/20 | 0.20 | -0.40 | No | No |
 
-The pass/fail count above hides the actual PSI *magnitude*, which is the more
-informative view for this specific detector — PSI is usually read as a
-continuous score against the 0.10/0.20 scorecard folklore, not a binary flag:
+PSI kept its stricter 0.60 bar (§3.1), so the pass/fail count above still
+hides the more informative view for this specific detector — PSI is usually
+read as a continuous score against the 0.10/0.20 scorecard folklore, not a
+binary flag:
 
 ![PSI week-over-week trend, against the scorecard folklore bands](visuals/11_psi_weekly_trend.png)
 
-**Why it never fired.** The mean PSI across all 20 monitored features never
-leaves the 0.09–0.15 band — under even the "moderate shift" folklore
-threshold of 0.10 most weeks, let alone the pipeline's own bootstrap-null-
-calibrated bar. The **max** PSI (dashed line) tells the real story: it swings
-between 0.5 and 0.8 almost every week, entirely driven by one feature
-(`_mcols_na_bin`, the match-flag missingness pattern — §3.4's seasonal-step
-finding). One outlier feature out of twenty is nowhere near the 12-feature
-consensus PSI needs to confirm.
+**Why it never fired, even at the lower bar other detectors got.** The mean
+PSI across all 20 monitored features never leaves the 0.09–0.15 band — under
+even the "moderate shift" folklore threshold of 0.10 most weeks, let alone
+0.60-of-features consensus. The **max** PSI (dashed line) tells the real
+story: it swings between 0.5 and 0.8 almost every week, entirely driven by
+one feature (`_mcols_na_bin`, the match-flag missingness pattern — §3.4's
+seasonal-step finding, and the same feature topping KS's and Jensen-Shannon's
+panels in the chart below). One outlier feature out of twenty is nowhere near
+consensus even at 0.30, which is *why* PSI's own bar stayed at 0.60 — a
+lowered bar would not have changed PSI's silence this run, but would have
+made it far more exposed to noise in a run where that one feature's step
+happened to land differently.
+
+![Top individually-drifting features, by detector](visuals/22_per_method_top_features.png)
+
+PSI's own panel above is nearly identical to KS's and Jensen-Shannon's: the
+same missingness-pattern and Vesta-PCA trio at 14/14 weeks, then a sharp drop
+to a single counter-pattern feature at 4/14. The three tests disagree on
+*how many* features clear their line each week, but agree almost exactly on
+*which* features are actually moving.
 
 #### 3.3.3 Jensen-Shannon (distributional, label-free)
 
-| Week | Features crossed | Fraction | vs. 0.60 consensus | Raw alarm | Confirmed |
+| Week | Features crossed | Fraction | vs. 0.30 consensus | Raw alarm | Confirmed |
 |---|---|---|---|---|---|
-| 1 | 8/20 | 0.40 | -0.20 | No | No |
-| 2 | 9/20 | 0.45 | -0.15 | No | No |
-| 3 | 7/20 | 0.35 | -0.25 | No | No |
-| 4 | 8/20 | 0.40 | -0.20 | No | No |
-| 5 | 7/20 | 0.35 | -0.25 | No | No |
-| 6 | 9/20 | 0.45 | -0.15 | No | No |
-| 7 | 9/20 | 0.45 | -0.15 | No | No |
-| 8 | 9/20 | 0.45 | -0.15 | No | No |
-| 9 | 9/20 | 0.45 | -0.15 | No | No |
-| 10 | 9/20 | 0.45 | -0.15 | No | No |
-| 11 | 6/20 | 0.30 | -0.30 | No | No |
-| 12 | 10/20 | 0.50 | -0.10 | No | No |
-| 13 | 9/20 | 0.45 | -0.15 | No | No |
-| 14 | 9/20 | 0.45 | -0.15 | No | No |
+| 1 | 8/20 | 0.40 | +0.10 | Yes | No |
+| 2 | 9/20 | 0.45 | +0.15 | Yes | **Yes** |
+| 3 | 7/20 | 0.35 | +0.05 | Yes | No |
+| 4 | 7/20 | 0.35 | +0.05 | Yes | **Yes** |
+| 5 | 6/20 | 0.30 | +0.00 | Yes | No |
+| 6 | 7/20 | 0.35 | +0.05 | Yes | **Yes** |
+| 7 | 6/20 | 0.30 | +0.00 | Yes | No |
+| 8 | 6/20 | 0.30 | +0.00 | Yes | **Yes** |
+| 9 | 6/20 | 0.30 | +0.00 | Yes | No |
+| 10 | 6/20 | 0.30 | +0.00 | Yes | **Yes** |
+| 11 | 5/20 | 0.25 | -0.05 | No | No |
+| 12 | 7/20 | 0.35 | +0.05 | Yes | No |
+| 13 | 6/20 | 0.30 | +0.00 | Yes | **Yes** |
+| 14 | 5/20 | 0.25 | -0.05 | No | No |
 
-**Why it never fired.** Jensen-Shannon is the closest of the three
-distributional tests to actually confirming — it reaches 0.50 at week 12,
-one feature short of the 12/20 line — but it is measuring the same thing KS
-and PSI measure (bounded, symmetric distributional distance), so it inherits
-the same blind spot: it is structurally unable to see a relationship change
-that leaves the feature marginals intact.
+**Why it now confirms 6 of 14 weeks — tied for the most of any detector this
+run.** Jensen-Shannon measures the same bounded, symmetric distributional
+distance as KS and PSI, so it inherits the same structural blindness to
+relationship changes that leave marginals intact (§3.1). What changed is not
+the underlying signal — it is the *same* small cluster of persistently-drifting
+features (the missingness pattern, both Vesta components, and `D2`/`D15`,
+per §3.4) driving Jensen-Shannon's fraction to 0.30 or above in **12 of the
+14 weeks**, and 0.30 was low enough to catch nearly all of them:
+
+![Top individually-drifting features, by detector](visuals/22_per_method_top_features.png)
+
+Jensen-Shannon's panel above shows five features at 14/14 weeks and a sixth
+(`D2`, "Days since prior event 2") at 11/14 — one more persistently-crossing
+feature than either KS or PSI shows, which is exactly the margin that pushes
+its weekly fraction from KS's 0.15–0.35 range up to 0.25–0.45. The lesson
+this detector demonstrates cleanly: **a distributional test's confirmed-alarm
+count is far more a function of the consensus bar than of "real" vs. "fake"
+drift** — the same underlying feature-level signal produces 0 confirmations
+at 0.60 and 6 at 0.30, and neither number is more "correct" without
+specifying what a false alarm should cost.
 
 #### 3.3.4 SHAP / attribution (explanation, label-free)
 
 The only label-free detector with a real mechanism for catching concept
 drift — it watches what the model *relies on*, not what the data *looks
-like* — but still never confirms at the corrected 20-feature monitoring set:
+like* — and even at the lowered 0.30 bar, it still confirms zero weeks:
 
-| Week | Features crossed | Fraction | vs. 0.60 consensus | Raw alarm | Confirmed |
+| Week | Features crossed | Fraction | vs. 0.30 consensus | Raw alarm | Confirmed |
 |---|---|---|---|---|---|
-| 1 | 5/20 | 0.25 | -0.35 | No | No |
-| 2 | 4/20 | 0.20 | -0.40 | No | No |
-| 3 | 1/20 | 0.05 | -0.55 | No | No |
-| 4 | 5/20 | 0.25 | -0.35 | No | No |
-| 5 | 2/20 | 0.10 | -0.50 | No | No |
-| 6 | 1/20 | 0.05 | -0.55 | No | No |
-| 7 | 1/20 | 0.05 | -0.55 | No | No |
-| 8 | 4/20 | 0.20 | -0.40 | No | No |
-| 9 | 2/20 | 0.10 | -0.50 | No | No |
-| 10 | 3/20 | 0.15 | -0.45 | No | No |
-| 11 | 1/20 | 0.05 | -0.55 | No | No |
-| 12 | 1/20 | 0.05 | -0.55 | No | No |
-| 13 | 4/20 | 0.20 | -0.40 | No | No |
-| 14 | 6/20 | 0.30 | -0.30 | No | No |
+| 1 | 5/20 | 0.25 | -0.05 | No | No |
+| 2 | 4/20 | 0.20 | -0.10 | No | No |
+| 3 | 1/20 | 0.05 | -0.25 | No | No |
+| 4 | 5/20 | 0.25 | -0.05 | No | No |
+| 5 | 2/20 | 0.10 | -0.20 | No | No |
+| 6 | 1/20 | 0.05 | -0.25 | No | No |
+| 7 | 1/20 | 0.05 | -0.25 | No | No |
+| 8 | 4/20 | 0.20 | -0.10 | No | No |
+| 9 | 2/20 | 0.10 | -0.20 | No | No |
+| 10 | 3/20 | 0.15 | -0.15 | No | No |
+| 11 | 1/20 | 0.05 | -0.25 | No | No |
+| 12 | 1/20 | 0.05 | -0.25 | No | No |
+| 13 | 4/20 | 0.20 | -0.10 | No | No |
+| 14 | 6/20 | 0.30 | +0.00 | Yes | No |
 
 SHAP crosses threshold on *fewer* features per week than any other
-vote-based detector — it is the most conservative of the four by a wide
-margin. The feature-level view explains why: how much each feature's
+vote-based detector even at the lower bar — it produces exactly one raw
+alarm (week 14) in the entire replay, and no second consecutive week to
+confirm it. The feature-level view explains why: how much each feature's
 importance actually moves, averaged over all 14 weeks —
 
 ![SHAP: which features' influence on the model shifts the most](visuals/12_shap_importance_shift.png)
 
-**Why it never fired.** Even the single most-shifting feature (the
-match-flag missingness pattern) moves by only 0.019 in mean |importance
-shift| — two orders of magnitude below the kind of swing that would flip a
-model's reliance on a feature. The model's *attributions* are simply stable
-across the replay, even in weeks where its *accuracy* is not — a genuinely
-informative negative result: whatever is driving the AUC drops in §3.3.9 and
-§3.3.10 below, it is not a change in which features the model leans on.
+**Why it barely fired even at a bar half the height of the others'.** Even
+the single most-shifting feature (the match-flag missingness pattern) moves
+by only 0.019 in mean |importance shift| — two orders of magnitude below the
+kind of swing that would flip a model's reliance on a feature. Lowering the
+*consensus* bar from 0.30 to 0.60 (§3.1) doesn't help here, because SHAP's
+bottleneck isn't the vote threshold — it's the per-feature significance test
+upstream of the vote (§3.2's `alpha`/`min_effect` gate), which almost never
+individually flags a feature to begin with:
+
+![Top individually-drifting features, by detector](visuals/22_per_method_top_features.png)
+
+SHAP's own panel above looks structurally different from KS/PSI/Jensen-
+Shannon's: its top feature is **`DeviceInfo`** (12/14 weeks), not the
+missingness-pattern/Vesta trio that dominates the other three. That is a
+genuinely different signal — SHAP is picking up on `DeviceInfo`'s changing
+*importance to the model's predictions*, not a shift in its raw distribution
+— but even that signal's magnitude is far too small to move the vote. The
+model's *attributions* are simply stable across the replay, even in weeks
+where its *accuracy* is not (§3.3.9, §3.3.10) — a genuinely informative
+negative result: whatever is driving those AUC drops, it is not a change in
+which features the model leans on.
 
 #### 3.3.5 DDM (performance, needs labels)
 
@@ -578,11 +734,11 @@ where a *falling* metric — not a rising one — signals drift:
 | 7 | 10.6051 | 10.1164 | No | No | v1 |
 | 8 | 10.2722 | 10.1164 | No | No | v1 |
 | 9 | 10.1934 | 10.1164 | Yes | No | v1 |
-| 10 | 10.1243 | 10.1164 | Yes | **Yes** | v7 |
-| 11 | 9.6959 | 11.0349 | Yes | No | v7 |
-| 12 | 9.7206 | 11.0349 | Yes | **Yes** | v9 |
-| 13 | 10.8996 | 11.3737 | Yes | No | v9 |
-| 14 | 10.6470 | 11.3737 | Yes | **Yes** | v11 |
+| 10 | 10.1243 | 10.1164 | Yes | **Yes** | v8 |
+| 11 | 9.6959 | 11.0349 | Yes | No | v8 |
+| 12 | 9.7206 | 11.0349 | Yes | **Yes** | v10 |
+| 13 | 10.8996 | 11.3737 | Yes | No | v10 |
+| 14 | 10.6470 | 11.3737 | Yes | **Yes** | v12 |
 
 > EDDM alarms when the metric value *drops below* its boundary (errors
 > bunching closer together = more frequent errors); it is the only detector
@@ -630,7 +786,7 @@ bound (its own historical best window's uncertainty plus the current
 window's) — so "close" here does not mean "nearly triggered." Read together
 with DDM, the two Bernoulli/Hoeffding-style detectors in this project simply
 never found this error stream to look anomalous relative to its own history,
-even in weeks the other nine detectors flagged loudly.
+even in weeks several other detectors flagged loudly.
 
 #### 3.3.8 ADWIN (performance-adjacent, label-free)
 
@@ -643,13 +799,13 @@ even in weeks the other nine detectors flagged loudly.
 | 5 | 5.348 | 3.090 | Yes | No | v2 |
 | 6 | 3.150 | 3.090 | No | No | v2 |
 | 7 | 5.289 | 3.090 | Yes | No | v2 |
-| 8 | 6.328 | 3.090 | Yes | **Yes** | v5 |
-| 9 | 3.585 | 3.090 | Yes | No | v5 |
-| 10 | 2.421 | 3.090 | Yes | **Yes** | v7 |
-| 11 | 6.372 | 3.090 | Yes | No | v7 |
-| 12 | 9.461 | 3.090 | Yes | **Yes** | v9 |
-| 13 | 1.602 | 3.090 | Yes | No | v9 |
-| 14 | 0.055 | 3.090 | No | No | v9 |
+| 8 | 6.328 | 3.090 | Yes | **Yes** | v6 |
+| 9 | 3.585 | 3.090 | Yes | No | v6 |
+| 10 | 2.421 | 3.090 | Yes | **Yes** | v8 |
+| 11 | 6.372 | 3.090 | Yes | No | v8 |
+| 12 | 9.461 | 3.090 | Yes | **Yes** | v10 |
+| 13 | 1.602 | 3.090 | Yes | No | v10 |
+| 14 | 0.055 | 3.090 | No | No | v10 |
 
 ![ADWIN: mean-shift z-score vs. its formal threshold](visuals/15_adwin_zscore_trend.png)
 
@@ -660,7 +816,7 @@ threshold and back within a couple of weeks (weeks 3→4→6, or 10→11→12→
 ADWIN has a real formal guarantee (it correctly detects *a* mean shift in the
 prediction stream), but "a mean shift happened" and "the model is stale" are
 different claims — this is the detector §3.5 shows loses to random-timed
-retraining at the same budget (5.5th percentile), and this table is the
+retraining at the same budget (0.5th percentile), and this table is the
 mechanism: it is reacting to week-to-week turbulence, not accumulated
 staleness.
 
@@ -674,28 +830,29 @@ staleness.
 | 4 | 0.0329 | 0.0109 | Yes | No | v1 |
 | 5 | 0.0383 | 0.0125 | Yes | **Yes** | v3 |
 | 6 | 0.0303 | 0.0121 | Yes | No | v3 |
-| 7 | 0.0359 | 0.0141 | Yes | **Yes** | v4 |
-| 8 | 0.0441 | 0.0128 | Yes | No | v4 |
-| 9 | 0.0442 | 0.0151 | Yes | **Yes** | v6 |
-| 10 | 0.0484 | 0.0166 | Yes | No | v6 |
-| 11 | 0.0403 | 0.0125 | Yes | **Yes** | v8 |
-| 12 | 0.0382 | 0.0132 | Yes | No | v8 |
-| 13 | 0.0262 | 0.0115 | Yes | **Yes** | v10 |
-| 14 | 0.0178 | 0.0316 | No | No | v10 |
+| 7 | 0.0359 | 0.0141 | Yes | **Yes** | v5 |
+| 8 | 0.0441 | 0.0128 | Yes | No | v5 |
+| 9 | 0.0442 | 0.0151 | Yes | **Yes** | v7 |
+| 10 | 0.0484 | 0.0166 | Yes | No | v7 |
+| 11 | 0.0403 | 0.0125 | Yes | **Yes** | v9 |
+| 12 | 0.0382 | 0.0132 | Yes | No | v9 |
+| 13 | 0.0262 | 0.0115 | Yes | **Yes** | v11 |
+| 14 | 0.0178 | 0.0316 | No | No | v11 |
 
 ![Prequential AUC: current performance vs. its own reference](visuals/16_prequential_auc_trend.png)
 
-**Why it fired the most (6 confirmed, tied for most raw alarms too).**
-Prequential AUC measures the thing that actually matters — ranking quality —
-directly, with no proxy in between. The cost of that directness is visible in
-the chart: current-week AUC sits *below* the reference line in nearly every
-single week, because the reference resets to a fresh (higher) validation AUC
-every time the detector retrains, and the gap immediately starts reopening.
-With an AUC drop above its own effective threshold almost every week, the
-2-of-2 persistence gate is nearly always satisfied — which is exactly why
-§3.5 shows this policy retraining 6 times for a *worse* mean AUC than the
-best 2-retrain policy: it is strictly reactive, confirming damage that has
-already happened rather than anticipating it.
+**Why it fired the most (6 confirmed — tied with Jensen-Shannon, §3.3.3 —
+and tied for most raw alarms too).** Prequential AUC measures the thing that
+actually matters — ranking quality — directly, with no proxy in between. The
+cost of that directness is visible in the chart: current-week AUC sits
+*below* the reference line in nearly every single week, because the
+reference resets to a fresh (higher) validation AUC every time the detector
+retrains, and the gap immediately starts reopening. With an AUC drop above
+its own effective threshold almost every week, the 2-of-2 persistence gate is
+nearly always satisfied — which is exactly why §3.5 shows this policy
+retraining 6 times for a *worse* mean AUC than the best 2-retrain policy: it
+is strictly reactive, confirming damage that has already happened rather than
+anticipating it.
 
 #### 3.3.10 Champion vs Challenger (shadow model, needs labels)
 
@@ -711,13 +868,13 @@ below shows it has two independent ways to fire, not one:
 | 5 | 0.0037 | 0.0300 | 0.0383 | 0.0500 | No | No | v1 |
 | 6 | 0.0270 | 0.0300 | 0.0418 | 0.0500 | No | No | v1 |
 | 7 | 0.0228 | 0.0300 | 0.0502 | 0.0500 | Yes | No | v1 |
-| 8 | 0.0207 | 0.0300 | 0.0607 | 0.0500 | Yes | **Yes** | v5 |
-| 9 | -0.0114 | 0.0300 | 0.0413 | 0.0500 | No | No | v5 |
-| 10 | 0.0215 | 0.0300 | 0.0477 | 0.0500 | No | No | v5 |
-| 11 | 0.0189 | 0.0300 | 0.0406 | 0.0500 | No | No | v5 |
-| 12 | 0.0475 | 0.0300 | 0.0493 | 0.0500 | Yes | No | v5 |
-| 13 | 0.0159 | 0.0300 | 0.0362 | 0.0500 | No | No | v5 |
-| 14 | -0.1485 | 0.0300 | 0.0296 | 0.0500 | No | No | v5 |
+| 8 | 0.0207 | 0.0300 | 0.0607 | 0.0500 | Yes | **Yes** | v6 |
+| 9 | -0.0114 | 0.0300 | 0.0413 | 0.0500 | No | No | v6 |
+| 10 | 0.0215 | 0.0300 | 0.0477 | 0.0500 | No | No | v6 |
+| 11 | 0.0189 | 0.0300 | 0.0406 | 0.0500 | No | No | v6 |
+| 12 | 0.0475 | 0.0300 | 0.0493 | 0.0500 | Yes | No | v6 |
+| 13 | 0.0159 | 0.0300 | 0.0362 | 0.0500 | No | No | v6 |
+| 14 | -0.1485 | 0.0300 | 0.0296 | 0.0500 | No | No | v6 |
 
 > Fires when EITHER the gap clears 0.03 (and its own bootstrap standard
 > error, so a noisy small-sample gap doesn't count) OR degradation from
@@ -731,11 +888,13 @@ compared, week by week:
 
 ![Champion vs. Challenger: would retraining actually help this week?](visuals/17_champion_challenger.png)
 
-**Why only 2 of 14 confirmed, despite 4 raw alarms.** The persistence gate
+**Why only 2 of 14 confirmed, despite 5 raw alarms.** The persistence gate
 is the whole story here: weeks 1 and 7 raise a raw alarm (degradation just
 past 0.05) but are immediately followed by a week that drops back under
 threshold (week 2 still qualifies and confirms; week 8 also still qualifies
-and confirms) — but weeks 4–6 and 9–13 never sustain two in a row. This is
+and confirms) — week 12's raw alarm has no adjacent partner in either
+direction, so it confirms nothing — and weeks 4–6, 9–11, and 13 never sustain
+two in a row. This is
 the most direct of the twelve questions ("would retraining actually help
 this week?") and the persistence gate keeps it from overreacting to any
 single noisy week — the discipline that makes it the best classical policy
@@ -745,7 +904,28 @@ in §3.5, at only 2 retrains.
 
 K-Means with a **fixed k = 5** clusters — not learned or tuned per week,
 fit once on the reference window and never refit, exactly like every other
-frozen encoder in this pipeline (§1.3):
+frozen encoder in this pipeline (§1.3). "Fixed" means literally that: 5 is a
+hyperparameter choice, not something the pipeline searches over, and the
+same 5 cluster centroids (computed once, on the reference window) are what
+every later week is measured against.
+
+**How many records land in each cluster, training vs. every test week.** The
+reference fit used a 20,000-row sample of the 90-day baseline; each cluster's
+share of that sample, compared against its share of every later week's rows:
+
+![Cluster composition (k=5, fit once on 20,000 reference rows): reference vs. every test week](visuals/19_cluster_composition.png)
+
+Two things stand out. First, the five clusters are **not close to balanced**
+even on the reference — cluster 0 alone holds ~38–45% of rows every week,
+while **cluster 3 holds just 70 of 20,000 reference rows (0.35%)** and
+**drops to literally zero** in most test weeks. K-Means was never asked for
+balanced clusters; it partitions by density, and this dataset apparently has
+one small, distinct pocket of transactions that the algorithm isolated into
+its own (nearly empty, going forward) cluster. Second, the four non-trivial
+clusters' shares do shift gently week to week — cluster 1 (orange) swells
+from ~7% at reference to ~15% in week 4, for instance — but never sharply
+enough on their own to move `cluster_psi` past 0.15 in most weeks (the table
+below).
 
 | Week | Centroid distance ratio | Distance threshold (1.5) | Cluster-assignment PSI | PSI threshold (0.2) | Raw alarm | Confirmed | Model version after this week |
 |---|---|---|---|---|---|---|---|
@@ -781,6 +961,23 @@ however large, does not get to trigger a retrain on its own. (This same week
 top-drifting-feature data in §3.4 — three unrelated methods agreeing makes
 it a real, corroborated one-week anomaly, just not a *sustained* one.)
 
+**Which features actually drive the distance shift.** Clustering is
+multivariate by design — no single feature "causes" a distance-ratio change —
+but each point's squared deviation from its assigned centroid can still be
+broken down feature by feature, and compared against the same breakdown on
+the reference. Summed across all 14 weeks' top-5 contributors:
+
+![Clustering: which features drive the centroid-distance shift most often](visuals/20_clustering_feature_contributions.png)
+
+The same short list dominates as in §3.4: the counter-zero pattern and both
+`D`-column timedeltas (`D15`, `D2`) are in the top-5 contributors in every
+single week, with transaction amount and the match-flag missingness pattern
+close behind. This is the multivariate confirmation of the univariate story —
+the handful of features individually flagged by KS/PSI/Jensen-Shannon are
+also the ones geometrically pulling points away from their reference
+centroids, which is exactly what should happen if those features really are
+the (mostly seasonal, per §3.4) source of whatever movement exists.
+
 #### 3.3.12 Autoencoder (representation, label-free)
 
 A bottleneck MLP trained once on the reference window, monitoring
@@ -814,6 +1011,24 @@ noticing the same single week, and neither one confirming it, is itself a
 useful result: it says the week-12 event was real but genuinely
 one-off, not the start of a sustained shift — exactly the kind of event a
 persistence-gated policy is designed to not overreact to.
+
+**Which features the autoencoder reconstructs badly.** Reconstruction error
+is also a per-feature quantity before it gets averaged into one RMSE — each
+column's squared reconstruction error can be compared, feature by feature,
+against its own reference-window baseline:
+
+![Autoencoder: which features drive reconstruction error most often](visuals/21_autoencoder_feature_contributions.png)
+
+The top contributor is `D15` ("Days since prior event 15" — 13 of 14 weeks),
+followed by the counter-zero pattern (12/14) and `D2` (11/14) — the same
+trio driving the clustering distance shift above, plus two features
+(card-issuer-x-sub-type, billing address region) that don't appear
+prominently in the univariate feature-vote tables at all. That last point is
+the autoencoder's genuine contribution: it is picking up a *joint*
+reconstruction difficulty involving card/address fields that no single-feature
+test would surface on its own, even though — per the z-score table — that
+difficulty never accumulates into an aggregate RMSE large enough to cross
+3.0.
 
 
 ### 3.4 Which specific features are actually drifting, and how often
@@ -851,54 +1066,84 @@ mechanisms:
 ### 3.5 Classical detectors as retraining policies — the surprising result
 
 Detecting drift and knowing when to *retrain* are not the same question.
-Turning each detector into a real policy and measuring out-of-sample AUC:
+Turning each detector into a real policy and measuring out-of-sample AUC —
+now with KS and Jensen-Shannon included, since the lowered consensus bar
+(§3.1) means they actually retrain something this run:
 
 | Policy | Retrains | Mean AUC | vs. randomly-timed policies of equal cost |
 |---|---|---|---|
-| **Champion vs Challenger** | 2 | **0.8819** | 81st percentile |
-| EDDM | 3 | 0.8776 | 21.5th percentile |
-| Prequential AUC | 6 | 0.8760 | 20th percentile |
-| ADWIN | 5 | 0.8733 | 5.5th percentile |
-| *Always retrain (all 13 weeks)* | 13 | 0.8726 | — |
+| **Champion vs Challenger** | 2 | **0.8804** | 67.5th percentile |
+| Prequential AUC | 6 | 0.8772 | 19th percentile |
+| KS test | 1 | 0.8770 | 51.5th percentile |
+| EDDM | 3 | 0.8768 | 12th percentile |
+| Jensen-Shannon | 6 | 0.8768 | 17.5th percentile |
+| *Always retrain (all 13 weeks)* | 13 | 0.8743 | — |
+| ADWIN | 5 | 0.8733 | 0.5th percentile |
 | *Never retrain* | 0 | 0.8725 | — |
 
-Two findings stand out:
+Three findings stand out:
 
-1. **Retraining every single week buys statistically nothing** — 13 retrains
-   improve mean AUC by +0.0001 over never retraining. Two *well-timed*
-   retrains improve it by +0.0094 — roughly two orders of magnitude the
-   benefit, at 15% of the cost.
+1. **Retraining every single week still buys almost nothing** — 13 retrains
+   improve mean AUC by +0.0018 over never retraining. Champion vs
+   Challenger's two *well-timed* retrains improve it by +0.0079 — more than
+   four times the benefit, at 15% of the cost.
 2. **Detectors that retrain more than twice a replay are worse than a coin
-   flip at the same budget.** ADWIN, at 5 retrains, sits at just the 5.5th
+   flip at the same budget.** ADWIN, at 5 retrains, sits at just the 0.5th
    percentile of randomly-timed policies spending the same budget — you would
-   have beaten it ~94.5% of the time by picking retraining weeks at random.
+   have beaten it ~99.5% of the time by picking retraining weeks at random.
    Without that random-policy comparison, ADWIN would look like a success
    story (it does beat never-retraining) — this is exactly why the comparison
    matters.
+3. **A single well-timed KS retrain does surprisingly well — right at the
+   median of random-timed policies (51.5th percentile) — despite KS being the
+   detector §3.3.1 shows is structurally blind to concept drift.** This is
+   not a contradiction: one retrain at week 2, on a model that had only ever
+   seen the 90-day reference window, is close to *always going to help* no
+   matter what triggered it, simply because the model was maximally stale at
+   that point. It is weak evidence for KS specifically and strong evidence
+   for the same lesson as finding 1 — an early, well-timed retrain carries
+   most of the achievable benefit almost regardless of trigger quality.
+   Section 5.2 shows this same KS-triggered single retrain, applied to the
+   *neural* model instead of this section's LightGBM registry (§2.3), scoring
+   **worse** than never retraining at all — a concrete demonstration that
+   "how good a trigger is" can depend on which model it is triggering, not
+   just on the trigger itself.
 
 > ### 🎤 Speaker Notes — Section 3
 >
 > - Lead with the confirmed-alarms bar chart, then immediately pivot to the
 >   heatmap — the bar chart tells you *what*, the heatmap tells you *when and
->   how persistent*. The heatmap is the visual to leave on screen the longest;
->   it's the one that makes "concept drift, not covariate shift" visually
->   obvious (the top rows — all distributional/representation detectors — are
->   just empty).
+>   how persistent*. The heatmap is the visual to spend the most time on, but
+>   resist the temptation to summarise it as "distributional detectors stayed
+>   silent" — Jensen-Shannon's row is nearly as busy as the performance
+>   detectors' rows. The more defensible summary (§3.1) is that the confirmed
+>   distributional alarms all trace back to the same 2-3 features (§3.4), not
+>   a broad population shift — which the heatmap alone doesn't show; pair it
+>   with the top-drifting-features chart (§3.4) to make that point.
 > - The D-column bug story is a great moment to pause on if the professor is
 >   evaluating rigor, not just results — it demonstrates we didn't just trust
 >   "the model looks done," we went back and audited *why* specific features
 >   kept flagging, and found a real defect. This is the kind of thing a
 >   reviewer wants to see: results that survived being doubted.
 > - Be ready for "so which detector should I use in production?" The honest
->   answer, and the one to give: *it depends what kind of drift you expect,*
->   and on this dataset the answer would have been "none of the label-free
->   ones" — which is uncomfortable, because label-free monitoring (no waiting
->   for ground truth) is what most production systems actually run. That
->   discomfort is exactly the motivation for Section 4.
-> - The random-control percentile point (ADWIN at the 5.5th percentile) is the
+>   answer, and the one to give: *it depends what kind of drift you expect, and
+>   on your tolerance for false alarms* — Champion vs Challenger is the best
+>   *policy* this run, but it needs labels; among the label-free options,
+>   Jensen-Shannon at the 0.30 bar is the only one that reliably fires, and
+>   whether that is a feature or a liability depends on whether you want early
+>   warning on real-but-narrow feature drift or you specifically want to avoid
+>   retraining on it. There is no free lunch here, and that discomfort is part
+>   of the motivation for Section 4.
+> - The random-control percentile point (ADWIN at the 0.5th percentile) is the
 >   single most persuasive number in this section for a skeptical audience —
 >   it's the concrete evidence that "detects real drift" and "makes a good
->   retraining trigger" are different claims.
+>   retraining trigger" are different claims. The KS-test finding (§3.5,
+>   finding 3) is the second-best one to have ready: a single retrain
+>   triggered by a detector §3.3.1 shows is structurally blind to concept
+>   drift still lands at the 51.5th percentile on LightGBM, and *below*
+>   never-retrain on the neural model (§5.2) — good evidence that "did the
+>   trigger detect something real" and "did the retrain help" can diverge in
+>   either direction, and can even depend on which model is being retrained.
 > - §3.3 (the 12-detector deep dive) is reference material, not a slide to
 >   present linearly — don't walk through all twelve in a talk. Keep three in
 >   your pocket for questions: PSI (§3.3.2, the mean-vs-max chart is the best
@@ -1027,23 +1272,98 @@ episodes affordable on a 14-window dataset.
 ```mermaid
 flowchart TD
     IN["Drift signals + model context
-    (17-dim input)"] --> ENC["Drift Encoder
-    2-layer MLP, tanh activation, shared"]
+    17-dim input, normalised online
+    (running mean/var, clipped to +/-10)"] --> ENC["Drift Encoder
+    Linear(17,128) -> Tanh -> Linear(128,128) -> Tanh
+    shared trunk"]
     ENC --> POL["Policy Head
-    4 actions (categorical distribution)"]
+    Linear(128,4) -> logits -> Categorical
+    (do nothing / partial / full / hedge)"]
     ENC --> VAL["Value Head
-    V(s), a single scalar"]
+    Linear(128,1) -> V(s)"]
 ```
 
 The encoder is **shared** between the policy and value heads deliberately:
 with only 14 data points to learn from, the value head's gradient becomes
 extra supervision for the same small encoder, rather than each head having to
-learn its own representation from scratch. Trained with PPO: clipped
-surrogate objective, generalised advantage estimation, an entropy bonus to
-keep exploring, and gradient-norm clipping for stability. Exploration is
-epsilon-greedy during training (annealed from 0.30 to 0.02) and Thompson
-sampling (drawing from the learned action distribution rather than always
-taking the top choice) as a production-safe alternative.
+learn its own representation from scratch. Concretely (`rl_agent.DriftPolicyNet`):
+two `Linear → Tanh` blocks (17→128, 128→128) form the trunk, then a
+`Linear(128, 4)` policy head produces action logits and a separate
+`Linear(128, 1)` value head produces the scalar state value — both read off
+the same 128-dim encoded state.
+
+**Observation normalisation matters more than it looks.** The 17 inputs live
+on wildly different scales — a PSI ratio can be 12, a KS fraction is bounded
+in [0, 1], `progress` is in [0, 1], `weeks_since_full_retrain` is a small
+integer. Before anything reaches the encoder, each dimension is standardised
+using a running mean/variance estimated *online* from every observation the
+agent has ever seen (Welford-style incremental update, not a one-time fit),
+then clipped to ±10. Skipping this would spend most of the network's limited
+capacity (very few gradient steps are available at this data size) undoing
+the scale mismatch instead of learning a policy.
+
+**How PPO actually updates the weights.** Every update collects 8 fresh
+14-step episodes (112 transitions) by sampling actions from the current
+policy, then:
+
+1. **Advantage estimation (GAE).** For each transition, compute the TD
+   residual `δ_t = r_t + γ·V(s_{t+1}) − V(s_t)` and combine them recursively,
+   discounted by `γ·λ`, into an advantage `A_t` — this is Generalised
+   Advantage Estimation, `γ=0.95`, `λ=0.95`, bootstrapping from 0 at the end
+   of each 14-week episode (there is no "week 15" to bootstrap from). The
+   discounted return `R_t = A_t + V(s_t)` becomes the value head's regression
+   target. Advantages are standardised (zero mean, unit variance) across the
+   whole batch before use.
+2. **The clipped surrogate objective.** For each transition, the *probability
+   ratio* between the current and the (slightly older) policy that actually
+   took the action is `r_t(θ) = exp(log π_θ(a_t|s_t) − log π_θ_old(a_t|s_t))`.
+   The loss term is `−min(r_t(θ)·A_t, clip(r_t(θ), 1−ε, 1+ε)·A_t)` with
+   `ε = 0.2` — this is what "clipped" means: if an action turned out to have a
+   large positive advantage, the update is capped at pushing its probability
+   up by at most a factor of `1.2`, rather than being free to lurch the whole
+   policy toward it off one lucky batch. This is precisely the mechanism
+   named in §4.3 as the reason PPO fits a 14-step-episode, one-trajectory
+   problem better than an uncapped policy-gradient method would.
+3. **Total loss and the gradient step.** `loss = policy_loss + 0.5·value_loss
+   − 0.02·entropy`, where `value_loss` is mean-squared error between `V(s_t)`
+   and `R_t`, and the entropy term is *subtracted* (i.e. rewarded) to keep the
+   categorical distribution from collapsing onto one action too early. Adam
+   (`lr = 3e-4`) takes the step, gradients are clipped to a max norm of `0.5`
+   for stability, and — standard PPO practice — the **same** batch of 112
+   transitions is reused for 4 gradient steps (`epochs_per_update=4`) before
+   being discarded, which is why the clipping in step 2 matters: by the 4th
+   pass the policy has already moved, so the ratio is no longer ≈1.
+4. **Repeat.** 150 updates × 8 episodes/update × 14 steps/episode = 16,800
+   transitions of total experience, replaying the identical 14-week stream
+   under different action choices every time (§4.3's model-lattice trick is
+   what makes this affordable — none of these 1,200 episodes trains an actual
+   model).
+
+**A second bug worth telling, in the same spirit as §2.1's early-stopping
+story.** `DriftPolicyNet` supports an optional dropout layer for MC-dropout
+Thompson sampling (below), and an earlier version of this project left it on
+during training. PPO's clipped ratio in step 2 above assumes `π_θ_old` and
+`π_θ` are evaluated deterministically — with dropout active, re-evaluating
+the same state twice gives two different distributions purely from dropout
+noise, which the ratio then silently attributes to policy change. The result
+wasn't a crash; it was a policy that converged to "always retrain" — a
+locally defensible but far-from-optimal habit — leaving **46% of the
+available return on the table** relative to the fixed version. Dropout now
+defaults to `0.0` for training; it exists only as an opt-in for Thompson-mode
+inference (next paragraph), where the mismatch it causes doesn't apply
+because no PPO ratio is being computed at all.
+
+**Exploration.** *Training* samples directly from the categorical policy
+(standard PPO), with epsilon-greedy annealed from `0.30` to `0.02` across the
+150 updates as an additional exploration floor. *Production* (`mode='thompson'`)
+draws from the same learned categorical distribution instead of always taking
+the top action, so deployment keeps exploring in proportion to the agent's
+own confidence rather than a hand-tuned epsilon — and if the network is built
+with dropout enabled, this becomes an approximate MC-dropout draw over the
+value function too, though the honest label for this (per the code's own
+docstring) is *posterior sampling over actions*, not full parameter-space
+Thompson sampling — a true parameter posterior would need an ensemble or a
+Bayesian last layer, neither of which this project implements.
 
 ### 5.2 Benchmark results
 
@@ -1074,32 +1394,45 @@ headline number, because "RL beats every classical detector by 0.0135 AUC" is
 true and, on its own, would give a misleading impression of what earned that
 result.
 
-### 5.4 Do the drift detectors actually matter? Yes — but we only know that because we checked, and got it wrong once first
+### 5.4 Do the drift detectors actually matter? Yes — but we only know that because we checked, and got a different answer each time we did
 
 We trained three identical agents, differing only in what they can observe:
 
 ![Ablation: full agent vs. context-only vs. signals-only](visuals/09_ablation.png)
 
-The pattern is exact, not approximate: **"context only" (no drift signals)
-lands on precisely the naive always-partial-update policy — it gains nothing
-from having model-context features without drift signals. "Signals only" (no
-model context) lands on precisely the full agent's performance** — the drift
-signals alone are sufficient to recover the entire learned-policy advantage.
+**Current result: neither piece alone is sufficient — both "context only" and
+"signals only" land on precisely the naive always-partial-update policy
+(0.8820), and only the full combination of drift signals *and* model context
+reaches the complete learned-policy advantage (0.8831).** Read plainly: the
+model-context features (weeks since retrain, recent AUC, progress through
+the replay) and the drift-detector signals are individually necessary but
+neither is individually sufficient — the agent needs both to find the extra
+≈0.001 AUC over the naive baseline. This is a third distinct outcome from
+this ablation, not a repeat of either number reported in earlier versions of
+this document.
 
-**This result reversed once already**, on an earlier, buggy version of the
-feature pipeline (before the D-column bug in Section 3.4 was fixed, and
-before the monitoring set was widened from 10 to 20 features). That earlier
-run found the *opposite* — model context alone reproduced almost all of the
-full agent's performance, and dropping the drift signals cost almost
-nothing. We initially reported that as a negative result for feeding
-detector outputs to a learned controller. **We no longer believe that
-conclusion** — it was measured on a feature pipeline with a real defect in
-it. We consider the *reversal itself* more important than either individual
-result: a single feature-engineering bug and one redundancy fix were enough
-to flip a qualitative conclusion, on only 14 data points. Any claim drawn
-from an experiment this small should be treated as directionally suggestive,
-not as a settled fact — and this project has direct, empirical evidence for
-that caution, not just a theoretical worry about it.
+**This result has now changed twice**, across three points in this project's
+history. The *first* version (an early, buggy feature pipeline, before the
+D-column bug in §3.4 was fixed and before the monitoring set was widened from
+10 to 20 features) found context alone reproduced almost all of the full
+agent's performance, with drift signals contributing almost nothing. The
+*second* version (after both of those fixes) found the opposite — drift
+signals alone reproduced the full agent exactly, and context contributed
+nothing. This document's *current* rerun — after lowering the KS/Jensen-
+Shannon/SHAP consensus bar from 0.60 to 0.30 (§3.1), which changes what the
+`ks_mean_statistic` and `js_mean_distance` signals feeding the RL agent
+correlate with downstream, and after an environment/package update between
+runs — finds a third pattern: neither input group is sufficient alone. We do
+not have a controlled way to isolate which of those two changes (the
+threshold or the environment) is responsible, and we are not going to
+pretend otherwise. What we *can* say with confidence is the pattern across
+all three runs: **the qualitative conclusion of this specific ablation has
+never survived a rerun with materially different inputs, on this 14-data-point
+experiment.** We consider that instability itself the most important finding
+of §5.4 — more important than any of the three individual results — and it
+is the strongest empirical argument in this whole project for treating any
+single small-sample RL ablation as directionally suggestive at best, never as
+a settled fact.
 
 **What the agent's decisions actually rely on:**
 
@@ -1140,15 +1473,23 @@ a real but modest missed opportunity in what the learned policy captured.
 2. **Mostly, a cheaper way to adapt, not a smarter detector.** ~92% of the
    gain over the best classical detector is available to *any* system with a
    partial-update option, whether or not it uses learning at all.
-3. **A small but now-real role for the drift detectors** — necessary and
-   sufficient for the last ~8% of the gain, once measurement was fixed.
+3. **A small but real role for the drift detectors — necessary, but this
+   rerun shows not sufficient alone.** Neither the drift signals nor the
+   model-context features individually recover the full agent's advantage;
+   the current run needs both together for the last ≈0.001 AUC. Earlier
+   versions of this document found each input group *individually*
+   sufficient at different points — see point 5.
 4. **Forgetting turned from an assumed hazard into a measured quantity** —
    up to 0.0089 AUC recoverable by hedging, on this stream.
-5. **A methodological lesson bigger than any single number**: a project this
-   size (14 decision points) can flip its own qualitative conclusions from
-   one bug fix. That fragility is not a flaw to hide — it's the strongest
-   argument in the whole project for calibration checks (Section 1.3) and
-   ablations (Section 5.4) as required steps, not optional polish.
+5. **A methodological lesson bigger than any single number**: this specific
+   ablation (§5.4) has now produced three *different* qualitative
+   conclusions across three points in this project's history — context-only
+   sufficient, then signals-only sufficient, then neither sufficient alone —
+   from a combination of real bug fixes and a threshold/environment change,
+   on a 14-decision-point experiment. That instability is not a flaw to
+   hide — it's the strongest argument in the whole project for calibration
+   checks (Section 1.3) and ablations (Section 5.4) as required, repeated
+   steps, not a one-time box to tick.
 
 > ### 🎤 Speaker Notes — Section 5
 >
@@ -1157,13 +1498,16 @@ a real but modest missed opportunity in what the learned policy captured.
 >   "here's why that's not the whole story" is the intended rhetorical
 >   structure, and it's much more convincing delivered in that order than if
 >   you lead with the caveat.
-> - The ablation reversal (5.4) is the most sophisticated result in the
->   project and the one most likely to draw follow-up questions. Have the
->   specific numbers ready: pre-fix, signals contributed +0.0011 AUC and
->   removing them cost nothing; post-fix, removing them costs the *entire*
->   learned-policy gain. Be ready to say plainly: "we do not know if a third
->   bug fix would flip it again — that's exactly the point we're making about
->   small-sample fragility."
+> - The ablation's repeated reversal (5.4) is the most sophisticated result in
+>   the project and the one most likely to draw follow-up questions. Have the
+>   three data points ready: earliest run, context alone ≈ full agent, signals
+>   contributed nothing; next run (after the D-column bug fix), signals alone
+>   ≈ full agent exactly, context contributed nothing; this run, *neither*
+>   alone reaches the full agent — only the combination does. Be ready to say
+>   plainly: "this has now flipped twice, which is itself the finding — we
+>   would not bet on this specific ablation's qualitative conclusion surviving
+>   a fourth rerun either, and that is exactly the point we are making about
+>   small-sample fragility, demonstrated rather than just asserted."
 > - If your professor pushes on "so is RL worth it or not" — the honest,
 >   defensible answer: *worth it for the ceiling and for making forgetting
 >   measurable; not worth it if the only alternative under consideration is
@@ -1172,6 +1516,6 @@ a real but modest missed opportunity in what the learned policy captured.
 >   interesting and more defensible claim than "RL wins," and it's the actual
 >   finding.
 > - Close on point 5 in the summary — a project that can honestly report its
->   own result reversing is a stronger research artifact than one that
->   reports a single clean number, and that's a good note to end a
+>   own result reversing, twice, is a stronger research artifact than one
+>   that reports a single clean number, and that's a good note to end a
 >   presentation on for an academic audience.

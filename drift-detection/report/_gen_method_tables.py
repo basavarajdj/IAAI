@@ -38,15 +38,19 @@ def fmt(v, nd=4):
     return f'{float(v):.{nd}f}'
 
 
+FEATURE_VOTE_CONSENSUS = {'ks_stats': 0.30, 'psi': 0.60, 'kl_divergence': 0.30, 'shap': 0.30}
+
+
 def feature_vote_table(m, rows):
-    lines = ['| Week | Features crossed | Fraction | vs. 0.60 consensus | Raw alarm | Confirmed |',
+    consensus = FEATURE_VOTE_CONSENSUS[m]
+    lines = [f'| Week | Features crossed | Fraction | vs. {consensus:.2f} consensus | Raw alarm | Confirmed |',
              '|---|---|---|---|---|---|']
     for w in range(1, 15):
         r = rows[m][w]
         frac = float(r['features_crossed_fraction'])
         lines.append(
             f"| {w} | {int(float(r['features_crossed']))}/{int(float(r['features_total']))} "
-            f"| {frac:.2f} | {frac - 0.60:+.2f} | {'Yes' if r['raw_flag']=='True' else 'No'} "
+            f"| {frac:.2f} | {frac - consensus:+.2f} | {'Yes' if r['raw_flag']=='True' else 'No'} "
             f"| {'**Yes**' if r['confirmed_flag']=='True' else 'No'} |"
         )
     return '\n'.join(lines)

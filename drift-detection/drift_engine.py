@@ -942,6 +942,7 @@ class ClusteringDriftDetector:
 
     def fit_reference(self, X_ref):
         """Standardize, fit K-Means on reference data, and store baseline statistics."""
+        self.feature_names = list(X_ref.columns)
         X_clean = X_ref.fillna(0).values
         self.feature_mean = np.mean(X_clean, axis=0)
         self.feature_std = np.std(X_clean, axis=0)
@@ -950,18 +951,31 @@ class ClusteringDriftDetector:
 
         self.kmeans.fit(X_scaled)
 
-        _, counts = np.unique(self.kmeans.labels_, return_counts=True)
+        counts = np.bincount(self.kmeans.labels_, minlength=self.n_clusters)
+        self.ref_cluster_counts = counts.astype(int)
+        self.ref_n_rows = int(len(X_scaled))
         self.ref_cluster_dist = counts / len(X_scaled)
 
         dists = np.min(self.kmeans.transform(X_scaled), axis=1)
         self.ref_mean_dist = float(np.mean(dists))
+
+        # Per-feature contribution to distance-from-centroid, on the
+        # reference: how much of the average squared distance each monitored
+        # column is responsible for. This is what evaluate_drift compares
+        # against to explain *which features* are driving a distance-ratio
+        # change, rather than just reporting one aggregate number.
+        assigned_centroids = self.kmeans.cluster_centers_[self.kmeans.labels_]
+        self.ref_per_dim_sqdev = np.mean((X_scaled - assigned_centroids) ** 2, axis=0)
+
         self.is_fitted = True
 
-    def evaluate_drift(self, X_curr, distance_threshold=1.5, psi_threshold=0.2):
+    def evaluate_drift(self, X_curr, distance_threshold=1.5, psi_threshold=0.2, top_n_features=5):
         """Compare current batch against the fitted reference.
 
         Returns:
-            dict with drift_detected, warning_detected, distance_ratio, cluster_psi.
+            dict with drift_detected, warning_detected, distance_ratio, cluster_psi,
+            per-cluster record counts (reference and current), and the
+            monitored features contributing most to any distance shift.
         """
         if not self.is_fitted:
             return {
@@ -992,6 +1006,21 @@ class ClusteringDriftDetector:
             and not is_drift
         )
 
+        # Which monitored features are driving the distance-ratio change:
+        # same per-dimension squared-deviation-from-assigned-centroid measure
+        # as the reference, compared feature by feature.
+        assigned_centroids = self.kmeans.cluster_centers_[curr_labels]
+        curr_per_dim_sqdev = np.mean((X_clean - assigned_centroids) ** 2, axis=0)
+        per_dim_shift = curr_per_dim_sqdev - self.ref_per_dim_sqdev
+        top_idx = np.argsort(per_dim_shift)[::-1][:top_n_features]
+        top_contributing_features = [
+            {'feature': self.feature_names[i],
+             'ref_sqdev': float(self.ref_per_dim_sqdev[i]),
+             'curr_sqdev': float(curr_per_dim_sqdev[i]),
+             'shift': float(per_dim_shift[i])}
+            for i in top_idx
+        ]
+
         return {
             'drift_detected': is_drift,
             'warning_detected': is_warning,
@@ -999,6 +1028,12 @@ class ClusteringDriftDetector:
             'ref_mean_dist': float(self.ref_mean_dist),
             'curr_mean_dist': curr_mean_dist,
             'cluster_psi': float(cluster_psi),
+            'n_clusters': int(self.n_clusters),
+            'ref_n_rows': self.ref_n_rows,
+            'ref_cluster_counts': self.ref_cluster_counts.tolist(),
+            'curr_n_rows': int(len(X_clean)),
+            'curr_cluster_counts': curr_counts.tolist(),
+            'top_contributing_features': top_contributing_features,
         }
 
 
@@ -1041,6 +1076,7 @@ class AutoencoderDriftDetector:
     def fit_reference(self, X_ref):
         """Standardize, train the autoencoder on reference data, and record
         the baseline RMSE distribution."""
+        self.feature_names = list(X_ref.columns)
         X_clean = X_ref.fillna(0).values
         self.feature_mean = np.mean(X_clean, axis=0)
         self.feature_std = np.std(X_clean, axis=0)
@@ -1063,15 +1099,22 @@ class AutoencoderDriftDetector:
         self.ref_rmses = np.sqrt(np.mean((X_scaled - ref_recon) ** 2, axis=1))
         self.ref_rmse_mean = float(np.mean(self.ref_rmses))
         self.ref_rmse_std = float(np.std(self.ref_rmses))
+        # Per-feature reconstruction error on the reference — what each
+        # monitored column contributes to the aggregate RMSE, so a drifted
+        # week can be explained in terms of *which* columns the autoencoder
+        # started reconstructing badly, not just "error went up."
+        self.ref_per_feature_mse = np.mean((X_scaled - ref_recon) ** 2, axis=0)
         self.is_fitted = True
 
-    def evaluate_drift(self, X_curr, z_score_threshold=3.0):
+    def evaluate_drift(self, X_curr, z_score_threshold=3.0, top_n_features=5):
         """Compare current batch reconstruction error (RMSE) against baseline.
 
         Drift is detected when the mean RMSE z-score exceeds the threshold.
 
         Returns:
-            dict with drift_detected, warning_detected, mse_z_score, ks_stat, etc.
+            dict with drift_detected, warning_detected, mse_z_score, ks_stat,
+            and the monitored features contributing most to any reconstruction-
+            error increase.
         """
         if not self.is_fitted:
             return {
@@ -1096,6 +1139,17 @@ class AutoencoderDriftDetector:
         is_drift = bool(rmse_z_score > z_score_threshold)
         is_warning = bool(rmse_z_score > z_score_threshold * 0.67) and not is_drift
 
+        curr_per_feature_mse = np.mean((X_scaled - curr_recon) ** 2, axis=0)
+        per_feature_shift = curr_per_feature_mse - self.ref_per_feature_mse
+        top_idx = np.argsort(per_feature_shift)[::-1][:top_n_features]
+        top_contributing_features = [
+            {'feature': self.feature_names[i],
+             'ref_mse': float(self.ref_per_feature_mse[i]),
+             'curr_mse': float(curr_per_feature_mse[i]),
+             'shift': float(per_feature_shift[i])}
+            for i in top_idx
+        ]
+
         return {
             'drift_detected': is_drift,
             'warning_detected': is_warning,
@@ -1104,6 +1158,7 @@ class AutoencoderDriftDetector:
             'mse_z_score': float(rmse_z_score),
             'ks_stat': float(ks_stat),
             'p_value': float(p_val),
+            'top_contributing_features': top_contributing_features,
         }
 
 

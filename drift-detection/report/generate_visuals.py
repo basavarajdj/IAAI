@@ -202,6 +202,12 @@ def chart_03_confirmed_alarms_per_detector():
 
 
 # ── 04: Weekly trend of the four feature-vote detectors ────────────────────
+# KS / Jensen-Shannon / SHAP vote at a 0.30 consensus (6 of 20 features);
+# PSI keeps the stricter 0.60 (see run_drift_analysis.METHOD_THRESHOLDS —
+# per-method min_feature_fraction). Two different bars, so both are drawn.
+FEATURE_VOTE_CONSENSUS = {'ks_stats': 0.30, 'psi': 0.60, 'kl_divergence': 0.30, 'shap': 0.30}
+
+
 def chart_04_feature_vote_weekly_trend():
     df = rl('method_week_matrix.csv')
     methods = ['ks_stats', 'psi', 'kl_divergence', 'shap']
@@ -213,12 +219,15 @@ def chart_04_feature_vote_weekly_trend():
         sub = df[df['method'] == m].sort_values('week')
         ax.plot(sub['week'], sub['features_crossed_fraction'], marker='o',
                 markersize=4, linewidth=2, color=colors[m], label=label_map[m])
-    ax.axhline(0.60, color=INK_MUTED, linewidth=1.5, linestyle='--')
-    ax.text(0.3, 0.615, 'Consensus threshold (0.60)', fontsize=9, color=INK_MUTED)
+    ax.axhline(0.30, color=INK_MUTED, linewidth=1.5, linestyle='--')
+    ax.text(0.3, 0.315, 'KS / Jensen-Shannon / SHAP consensus (0.30 — 6 of 20 features)',
+            fontsize=8, color=INK_MUTED)
+    ax.axhline(0.60, color=INK_MUTED, linewidth=1.5, linestyle=':')
+    ax.text(0.3, 0.615, 'PSI consensus (0.60 — 12 of 20 features)', fontsize=8, color=INK_MUTED)
     ax.set_xlabel('Week')
     ax.set_ylabel('Fraction of monitored features crossed')
     ax.set_ylim(0, 0.7)
-    ax.set_title('Weekly trend of the four feature-vote detectors vs. consensus threshold',
+    ax.set_title('Weekly trend of the four feature-vote detectors vs. their consensus thresholds',
                   fontsize=12, pad=12)
     ax.legend(frameon=False, ncol=4, loc='upper center', bbox_to_anchor=(0.5, -0.12))
     ax.grid(axis='y', linewidth=0.6, zorder=0)
@@ -323,6 +332,10 @@ def chart_07_rl_policy_comparison():
         'eddm': 'EDDM',
         'champion_vs_challenger': 'Champion vs Challenger',
         'never_retrain': 'Never retrain',
+        'ks_stats': 'KS test',
+        'kl_divergence': 'Jensen-Shannon',
+        'psi': 'PSI',
+        'shap': 'SHAP',
     }
     rows = [(label_map.get(r['policy'], r['policy']), r['mean_auc']) for _, r in rlp.iterrows()]
     rows = sorted(rows, key=lambda r: r[1], reverse=True)
@@ -351,7 +364,8 @@ def chart_07_rl_policy_comparison():
 # RL benchmark* (rl_policy_comparison.csv, neural model) — ADWIN in this run —
 # not the LightGBM-benchmark winner from Section 3.4 (a different model, a
 # different table, not comparable to the RL numbers).
-CLASSICAL_POLICIES = {'adwin', 'prequential_auc', 'eddm', 'champion_vs_challenger'}
+CLASSICAL_POLICIES = {'adwin', 'prequential_auc', 'eddm', 'champion_vs_challenger',
+                      'ks_stats', 'kl_divergence', 'psi', 'shap'}
 
 
 def chart_08_gain_decomposition():
@@ -667,6 +681,134 @@ def chart_18_autoencoder_zscore_trend():
     savefig(fig, '18_autoencoder_zscore_trend.png')
 
 
+# ── 19: Clustering — cluster composition, reference vs. every test week ────
+def chart_19_cluster_composition():
+    weeks_data = weekly_records()
+    n_clusters = weeks_data[0]['method_status']['clustering']['n_clusters']
+    ref_counts = weeks_data[0]['method_status']['clustering']['ref_cluster_counts']
+    ref_n = weeks_data[0]['method_status']['clustering']['ref_n_rows']
+
+    labels = ['Reference\n(training)'] + [f'Week {r["week"]}' for r in weeks_data]
+    all_counts = [ref_counts] + [r['method_status']['clustering']['curr_cluster_counts'] for r in weeks_data]
+    all_n = [ref_n] + [r['method_status']['clustering']['curr_n_rows'] for r in weeks_data]
+    shares = np.array([[c / n for c in counts] for counts, n in zip(all_counts, all_n)])  # (15, k)
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    x = np.arange(len(labels))
+    bottom = np.zeros(len(labels))
+    cluster_colors = CATEGORICAL[:n_clusters]
+    for k in range(n_clusters):
+        vals = shares[:, k]
+        ax.bar(x, vals, bottom=bottom, color=cluster_colors[k], width=0.65,
+               label=f'Cluster {k}', zorder=3,
+               edgecolor=SURFACE, linewidth=1)
+        bottom += vals
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
+    ax.set_ylabel('Share of records')
+    ax.set_ylim(0, 1)
+    ax.set_title(f'Cluster composition (k={n_clusters}, fit once on {ref_n:,} reference rows): '
+                 f'reference vs. every test week', fontsize=12, pad=12)
+    ax.legend(frameon=False, ncol=n_clusters, loc='upper center', bbox_to_anchor=(0.5, -0.20))
+    ax.axvline(0.5, color=INK_MUTED, linewidth=1, linestyle=':')
+    style_axes(ax, hide_spines=('top', 'right', 'left'))
+    savefig(fig, '19_cluster_composition.png')
+
+
+# ── 20: Clustering — which features drive the distance-ratio shift ─────────
+def chart_20_clustering_feature_contributions():
+    freq, shift_sum = {}, {}
+    for r in weekly_records():
+        for item in r['method_status']['clustering'].get('top_contributing_features', []):
+            f = item['feature']
+            freq[f] = freq.get(f, 0) + 1
+            shift_sum[f] = shift_sum.get(f, 0.0) + item['shift']
+
+    top = sorted(freq.items(), key=lambda kv: (kv[1], shift_sum[kv[0]]), reverse=True)[:10][::-1]
+    labels = [feature_label(f) for f, _ in top]
+    vals = [c for _, c in top]
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    y = np.arange(len(labels))
+    ax.barh(y, vals, color=AQUA, height=0.6, zorder=3)
+    for yi, v in zip(y, vals):
+        ax.text(v + 0.15, yi, str(v), va='center', fontsize=9, color=INK_SECONDARY)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_xlabel('Weeks in the top-5 distance-driving features (out of 14)')
+    ax.set_title('Clustering: which features drive the centroid-distance shift most often',
+                 fontsize=11, pad=12)
+    ax.grid(axis='x', linewidth=0.6, zorder=0)
+    ax.set_axisbelow(True)
+    style_axes(ax, hide_spines=('top', 'right', 'left'))
+    savefig(fig, '20_clustering_feature_contributions.png')
+
+
+# ── 21: Autoencoder — which features drive reconstruction error ────────────
+def chart_21_autoencoder_feature_contributions():
+    freq, shift_sum = {}, {}
+    for r in weekly_records():
+        for item in r['method_status']['autoencoder'].get('top_contributing_features', []):
+            f = item['feature']
+            freq[f] = freq.get(f, 0) + 1
+            shift_sum[f] = shift_sum.get(f, 0.0) + item['shift']
+
+    top = sorted(freq.items(), key=lambda kv: (kv[1], shift_sum[kv[0]]), reverse=True)[:10][::-1]
+    labels = [feature_label(f) for f, _ in top]
+    vals = [c for _, c in top]
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    y = np.arange(len(labels))
+    ax.barh(y, vals, color=MAGENTA, height=0.6, zorder=3)
+    for yi, v in zip(y, vals):
+        ax.text(v + 0.15, yi, str(v), va='center', fontsize=9, color=INK_SECONDARY)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_xlabel('Weeks in the top-5 reconstruction-error-driving features (out of 14)')
+    ax.set_title('Autoencoder: which features drive reconstruction error most often',
+                 fontsize=11, pad=12)
+    ax.grid(axis='x', linewidth=0.6, zorder=0)
+    ax.set_axisbelow(True)
+    style_axes(ax, hide_spines=('top', 'right', 'left'))
+    savefig(fig, '21_autoencoder_feature_contributions.png')
+
+
+# ── 22: Per-method top drifting features (small multiples) ─────────────────
+def chart_22_per_method_top_features():
+    df = rl('method_week_matrix.csv')
+    methods = ['ks_stats', 'psi', 'kl_divergence', 'shap']
+    label_map = {'ks_stats': 'KS test', 'psi': 'PSI', 'kl_divergence': 'Jensen-Shannon', 'shap': 'SHAP'}
+    colors = {'ks_stats': BLUE, 'psi': ORANGE, 'kl_divergence': AQUA, 'shap': VIOLET}
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+    for ax, m in zip(axes.flat, methods):
+        sub = df[(df['method'] == m) & df['drifted_feature_names'].notna()]
+        counts = {}
+        for names in sub['drifted_feature_names']:
+            for n in str(names).split(';'):
+                n = n.strip()
+                if n:
+                    counts[n] = counts.get(n, 0) + 1
+        top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:6][::-1]
+        labels = [feature_label(f) for f, _ in top]
+        vals = [v for _, v in top]
+        y = np.arange(len(labels))
+        ax.barh(y, vals, color=colors[m], height=0.6, zorder=3)
+        for yi, v in zip(y, vals):
+            ax.text(v + 0.2, yi, str(v), va='center', fontsize=8, color=INK_SECONDARY)
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.set_xlabel('Weeks crossed (out of 14)', fontsize=9)
+        ax.set_title(label_map[m], fontsize=11, pad=8)
+        ax.grid(axis='x', linewidth=0.6, zorder=0)
+        ax.set_axisbelow(True)
+        style_axes(ax, hide_spines=('top', 'right', 'left'))
+
+    fig.suptitle('Top individually-drifting features, by detector', fontsize=13, y=1.00)
+    fig.tight_layout()
+    savefig(fig, '22_per_method_top_features.png')
+
+
 if __name__ == '__main__':
     print(f'Reading reports from: {REPORTS_DIR}')
     print(f'Writing visuals to:   {VISUALS_DIR}')
@@ -688,4 +830,8 @@ if __name__ == '__main__':
     chart_16_prequential_auc_trend()
     chart_17_champion_challenger()
     chart_18_autoencoder_zscore_trend()
+    chart_19_cluster_composition()
+    chart_20_clustering_feature_contributions()
+    chart_21_autoencoder_feature_contributions()
+    chart_22_per_method_top_features()
     print('Done.')
