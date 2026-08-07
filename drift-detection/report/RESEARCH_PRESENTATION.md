@@ -374,7 +374,7 @@ from §2.2) supports three genuinely different operations, all implemented in
 |---|---|
 | **Full retrain** | A brand-new `NeuralFraudModel` is trained from scratch (`.fit()`) — fresh weight initialisation, full 30-epoch training run with early stopping, on all cumulative data. Exactly as expensive as the LightGBM retrain, conceptually. |
 | **Partial update** | The **existing** model object is cloned (`.clone()` — a deep copy of the network, not a new one) and that copy's weights are fine-tuned for 5 epochs at **one-tenth the base learning rate**, on only the **last 4 weeks** of data. The input standardisation (mean/std) is *not* refit — it stays frozen from whenever the parent model was last fully trained, for the same reason the feature encoders are frozen (§1.3): refitting it would make the update partly a representation change in disguise. This always branches from the last **full** model, never chains from a previous partial update (§4.3) — bounding how far repeated fine-tuning can drift from a properly-trained baseline. |
-| **Hedge ensemble** | No training happens at all. The agent's current (adapted) model and the frozen original baseline model each produce a fraud probability for every row, and those two probability vectors are blended by a weight `α ∈ {0, 0.25, 0.5, 0.75, 1.0}` (§5's model lattice enumerates all five). This is why hedging is free — it costs one extra forward pass, not a training run. |
+| **Hedge ensemble** | No training happens at all. The agent's current (adapted) model and the frozen original baseline model each produce a fraud probability for every row, and those two probability vectors are blended by a weight `α ∈ {0, 0.25, 0.5, 0.75, 1.0}` (§5's model lattice enumerates all five). Hedging does not jump straight to a target weight — each hedge action steps `α` down exactly one rung toward the baseline (e.g. `1.0 → 0.75`), so recovering fully from an adapted model takes up to 4 consecutive hedges. A full retrain resets `α` back to `1.0`. This is why hedging is free — it costs one extra forward pass to blend two already-computed probability vectors, not a training run. |
 
 **The consequence worth remembering when reading Sections 3 and 5 side by
 side:** a confirmed alarm from, say, Champion vs Challenger in §3.3.10 has
@@ -1217,7 +1217,7 @@ is differentiable (Section 2.2):
 | Do nothing | Keep the current model | Free |
 | Partial update | Fine-tune the last *full* model on the recent 4 weeks | Cheap |
 | Full retrain | Rebuild on all data seen so far | Expensive |
-| Hedge ensemble | Shift weight from the current model toward the stable baseline | Free |
+| Hedge ensemble | Step the ensemble weight one rung toward the stable baseline (§2.3 has the exact ladder) | Free |
 
 **Reward** is realised performance improvement over a never-retrain baseline,
 minus the action's cost. A decision made in week *t* is graded starting week
@@ -1292,6 +1292,19 @@ two `Linear → Tanh` blocks (17→128, 128→128) form the trunk, then a
 `Linear(128, 1)` value head produces the scalar state value — both read off
 the same 128-dim encoded state.
 
+**What the value head actually outputs, and what it's for.** `V(s)` is the
+network's estimate of *expected total future reward from state `s`, if the
+current policy keeps acting* — not "was the last action good," but "how good
+does the rest of this episode look from here." It plays no role in choosing
+an action: `act()` never reads it except to log it. Its only two jobs are
+both inside the training update (step 1 and step 3 below): it is the
+baseline that GAE subtracts from raw returns to produce a lower-variance
+advantage signal, and it has its own regression loss that trains it to get
+better at that estimate over time. Deleting the value head and running plain
+REINFORCE would still work in principle — it would just need far more
+episodes to converge, which this project does not have the data to
+provide.
+
 **Observation normalisation matters more than it looks.** The 17 inputs live
 on wildly different scales — a PSI ratio can be 12, a KS fraction is bounded
 in [0, 1], `progress` is in [0, 1], `weeks_since_full_retrain` is a small
@@ -1353,23 +1366,47 @@ defaults to `0.0` for training; it exists only as an opt-in for Thompson-mode
 inference (next paragraph), where the mismatch it causes doesn't apply
 because no PPO ratio is being computed at all.
 
-**Exploration.** *Training* samples directly from the categorical policy
-(standard PPO), with epsilon-greedy annealed from `0.30` to `0.02` across the
-150 updates as an additional exploration floor. *Production* (`mode='thompson'`)
-draws from the same learned categorical distribution instead of always taking
-the top action, so deployment keeps exploring in proportion to the agent's
-own confidence rather than a hand-tuned epsilon — and if the network is built
-with dropout enabled, this becomes an approximate MC-dropout draw over the
-value function too, though the honest label for this (per the code's own
-docstring) is *posterior sampling over actions*, not full parameter-space
-Thompson sampling — a true parameter posterior would need an ensemble or a
-Bayesian last layer, neither of which this project implements.
+**Three ways to turn the policy head's output into an action** (`rl_agent.PPOAgent.act`,
+`mode=` parameter) — these three names reappear throughout §5.2's benchmark
+table, so the exact mechanics matter:
+
+| Mode | What it does | Where it's used |
+|---|---|---|
+| **`sample`** | Draw an action from the full categorical distribution the policy head outputs (e.g. 70% do-nothing / 20% partial / 5% full / 5% hedge → actually roll that distribution). Plus epsilon-greedy on top: with probability `ε` (annealed `0.30 → 0.02` across the 150 updates), ignore the policy entirely and pick a uniformly random action instead. | **Training only.** This is what PPO's math is defined against — the log-probability of the *sampled* action is what step 2's ratio compares old vs. new policy on. |
+| **`greedy`** | Take `argmax` of the policy head's logits — always the single most-probable action, deterministically, every time the same state recurs. No randomness at all. | **Evaluation.** "RL agent (greedy)" in §5.2's benchmark table is this mode: the agent's best, most-confident policy, run once, deterministically, over the 14-week replay. |
+| **`thompson`** | Draw from the *same* categorical distribution as `sample` (no epsilon-greedy), but intended for deployment rather than training. If the network was built with `dropout > 0` (off by default — see the bug story above), this additionally makes each forward pass stochastic, approximating a draw from a posterior over the value function too. | **Evaluation / production.** "RL agent (Thompson)" in §5.2 is this mode — a production-safe alternative to greedy that keeps exploring in proportion to the agent's own confidence instead of a hand-tuned epsilon, at the cost of run-to-run variability (§5.2's numbers for it are one particular draw, not a fixed point). |
+
+The honest label for `thompson` mode (per the code's own docstring) is
+*posterior sampling over actions*, not full parameter-space Thompson
+sampling — a true parameter posterior would need an ensemble or a Bayesian
+last layer, neither of which this project implements. With dropout at its
+default of `0.0`, `thompson` and `sample` are mechanically identical calls;
+the distinction is purely about *when* each is used (production monitoring
+vs. training rollouts) and that epsilon-greedy is layered on top of `sample`
+but not `thompson`.
 
 ### 5.2 Benchmark results
 
 Every policy below — classical detector, naive control, or the RL agent —
 acts on the **same neural classifier and the same precomputed model lattice**,
 so differences come from decisions, not training randomness or lucky seeds.
+"Policy" here means a rule that reads the current week's state and returns
+one of the four actions in §4.2 (`do nothing` / `partial update` / `full
+retrain` / `hedge`) — every row below is exactly that, evaluated once,
+deterministically, over the full 14-week replay (`DriftAdaptationEnv.run_policy`,
+§5.1's table above defines the difference between `greedy` and `thompson`
+specifically):
+
+| Policy | What it actually does |
+|---|---|
+| **RL agent (greedy)** | The trained PPO agent, `mode='greedy'` (§5.1) — deterministically takes its single most-confident action every week. |
+| **RL agent (Thompson)** | The same trained agent, `mode='thompson'` (§5.1) — samples from its learned action distribution instead of always taking the top choice; one particular random draw, not a fixed point. |
+| **Always partial update** | Ignore every signal; take `PARTIAL_UPDATE` every single week, unconditionally. The naive control from §5.3 that isolates how much of the RL agent's edge is just "having a cheap adaptation action," independent of any decision-making. |
+| **Always full retrain** | Ignore every signal; take `FULL_RETRAIN` every week (13 retrains total — there's no week 15 to retrain into on week 14). The maximally expensive, maximally aggressive baseline. |
+| **Fixed schedule (every 2 / 4 weeks)** | Full retrain on a metronome — week 2, 4, 6, ... (or 4, 8, 12, ...) — regardless of any signal. A calendar policy: tests whether *any* trigger logic beats simply retraining on a schedule. |
+| **Never retrain** | `DO_NOTHING` every week. The zero point reward is measured against (§4.2) — free, and the floor every other policy is expected to clear. |
+| **KS test / Jensen-Shannon / ADWIN / EDDM / Prequential AUC / Champion vs Challenger** | Each classical detector's *actual confirmed-retrain weeks from §3* (`unified_drift_report.json`'s `retrain_triggers`), replayed as a fixed-week policy against the *neural* model here — same trigger timing as §3, different model underneath (§2.3). This is what makes the KS-test comparison in §3.5, finding 3 possible: identical trigger weeks, two different models, two different verdicts. |
+| **Random control** (not its own row — a percentile attached to every row above) | For each policy, 200 randomly-timed policies are generated that spend the *exact same budget* (same count of full retrains, same count of partial updates, different random weeks), and `random_control_pct` records what fraction of those 200 random draws the real policy's mean AUC beat or matched. This is the number that separates "detected real drift" from "made a good retraining trigger" (§3.5) — a policy can lose to random timing at its own budget, which is a stronger indictment than merely losing to never-retrain. |
 
 ![RL policy comparison bar chart](visuals/07_rl_policy_comparison.png)
 
@@ -1396,7 +1433,25 @@ result.
 
 ### 5.4 Do the drift detectors actually matter? Yes — but we only know that because we checked, and got a different answer each time we did
 
-We trained three identical agents, differing only in what they can observe:
+We trained three identical agents — same architecture (§5.1), same
+hyperparameters, same 150-update training budget — differing only in what
+they are allowed to observe. The mechanism (`rl_env.DriftAdaptationEnv`'s
+`state_mask`) is a multiplicative mask over the 17-dim observation vector:
+masked entries are forced to exactly `0.0` before the network ever sees
+them, rather than being removed from the input. All three agents therefore
+share the identical 17-dimensional network input shape — the only difference
+is which of those 17 numbers are always zero:
+
+| Variant | `ks_drift_fraction` ... `weeks_since_reference` (11 drift signals) | `weeks_since_full_retrain` ... `progress` (6 context features) |
+|---|---|---|
+| **`full`** | real values | real values |
+| **`context_only`** | forced to `0.0` | real values |
+| **`signals_only`** | real values | forced to `0.0` |
+
+If `full` doesn't outperform `context_only`, the honest conclusion would be
+that the entire 12-detector apparatus contributes nothing and a calendar
+policy (position in the replay, time since last retrain) suffices on its
+own — which is exactly the comparison this ablation exists to make possible:
 
 ![Ablation: full agent vs. context-only vs. signals-only](visuals/09_ablation.png)
 
