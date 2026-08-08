@@ -69,7 +69,8 @@ so the document renders without rerunning anything):
 | Classical retraining-policy comparison (§3.5) | `reports/policy_comparison.csv` |
 | Method-by-method 14-week deep dive (§3.3) | `reports/method_week_matrix.csv`, `reports/unified_drift_report.json` |
 | Feature selection diagnostics — bagged importance, SHAP, redundancy (§1.4) | `reports/feature_selection_diagnostics.csv` |
-| Detector pairwise agreement | `reports/detector_agreement.csv` |
+| Detector pairwise agreement — week-level (§3.6), feature-level computed from these two | `reports/detector_agreement.csv`, `reports/method_week_matrix.csv` + `reports/unified_drift_report.json` |
+| Would retraining have helped, week by week (§3.7) | `reports/unified_drift_report.json` (`champion_vs_challenger.auc_gap` per week) |
 | Method-level pros/cons metadata (§3.2 table) | `reports/method_profiles.csv` |
 | Catastrophic-forgetting analysis (§5.5) | `reports/forgetting_analysis.csv` |
 | RL agent vs. classical/naive policy comparison (§5.2, §5.3) | `reports/rl_policy_comparison.csv` |
@@ -1109,6 +1110,120 @@ Three findings stand out:
    "how good a trigger is" can depend on which model it is triggering, not
    just on the trigger itself.
 
+### 3.6 Do the detectors even agree with each other?
+
+Section 3.3 covered each detector in isolation. This section asks the
+question that actually matters for someone deciding whether to trust any of
+them: **if you ran all twelve side by side, would they tell you the same
+story?** There are two separate ways two detectors can "agree" — on *which
+features* look like they're drifting, and on *which weeks* look alarming —
+and this section's central finding is that these two kinds of agreement
+behave completely differently.
+
+**Feature-level agreement is clean, and it draws a sharp family line.** For
+the six detectors that implicate specific features (the four feature-vote
+detectors, plus Clustering's and Autoencoder's per-feature contribution
+breakdowns from §3.3.11–§3.3.12), we can ask: across all 14 weeks, how
+similar is the *set of features each detector points at*? Cosine similarity
+between each pair's 20-feature "how often was this feature implicated"
+vectors answers that directly:
+
+![Do these detectors implicate the same features?](visuals/23_feature_agreement.png)
+
+The pattern is almost a textbook two-cluster block: **KS, PSI, and
+Jensen-Shannon agree with each other at 0.78–0.96** — unsurprising, since all
+three are variants of "does this feature's marginal distribution look
+different," computed on the same 20 columns. **Clustering and Autoencoder
+agree with each other at 0.81** — both are multivariate/geometric methods
+built on the same standardised feature space. But **across those two groups,
+agreement collapses to 0.25–0.44** — KS vs. Clustering is 0.37, KS vs. SHAP is
+0.41, SHAP vs. Autoencoder is 0.35. **SHAP is the most isolated detector in
+the whole matrix**, never exceeding 0.44 with anything — a direct, quantified
+confirmation of §3.3.4's finding that SHAP is picking up a genuinely
+different signal (`DeviceInfo`'s attribution weight) that the other five
+never surface as a top feature. Jensen-Shannon is the one interesting bridge:
+it agrees with Clustering and Autoencoder at 0.72, noticeably higher than
+KS's or PSI's 0.26–0.37 — because Jensen-Shannon's flagged set includes
+`_ccols_0_bin` and `D15` (the same columns Clustering and Autoencoder lean
+on), not just the `_mcols_na_bin`/Vesta-PCA pair KS and PSI are locked onto.
+
+**Week-level agreement is a completely different, much messier picture.**
+Instead of "same features," this asks "same *timing* of raw alarms" —
+already computed by the pipeline as a pairwise Jaccard similarity
+(`reports/detector_agreement.csv`):
+
+![Did these detectors raise raw alarms in the same weeks?](visuals/24_week_agreement.png)
+
+This heatmap does **not** cleanly reproduce the family blocks from the
+feature-level matrix. Jensen-Shannon agrees with ADWIN on *timing* (0.57) more
+than it agrees with KS (0.17) — even though KS is Jensen-Shannon's closest
+relative by *feature substance* (0.85 in the chart above). Champion vs
+Challenger's timing agrees with KS at 0.50, its highest pairing of all,
+despite the two methods sharing no mechanism whatsoever — one watches feature
+marginals, the other trains a shadow model and checks its AUC. Most cells
+below the family diagonal (HDDM, SHAP, Clustering, Autoencoder rows) are
+simply `0.00`, or grey where a method never raised a raw alarm at all and the
+overlap is undefined.
+
+**This is the finding worth sitting with: agreement on *what* is drifting and
+agreement on *when* it looks alarming are close to independent axes.** Two
+detectors can implicate the same features yet fire in different weeks (KS and
+PSI: 0.96 feature agreement, but PSI never raw-fires at all under its
+threshold — 0.00 week agreement by definition). Two detectors can fire in the
+same weeks yet be responding to entirely different evidence (Champion vs
+Challenger and KS: 0.50 week agreement, built on unrelated mechanisms).
+**Neither axis alone tells you whether "drift" is real** — and this is
+precisely why a single binary vote across these methods cannot be trusted as
+a decision rule. A dashboard that reports "7 of 12 detectors say drift" is
+reporting a number that could mean "seven methods independently confirmed
+the same underlying feature shift" or "seven methods that don't actually
+agree with each other on anything happened to cross their own thresholds the
+same week" — and those are very different operational situations, indistinguishable
+from the vote count alone. You have to look at *which* detectors and *why*,
+every time — which is exactly the kind of per-detector reasoning §3.3 exists
+to make possible, and exactly what a fixed voting threshold throws away.
+
+### 3.7 Does retraining actually help? The direct numbers
+
+Section 3.5 already showed the aggregate answer is uncomfortable: retraining
+every week (13 retrains) beats never retraining by only **+0.0018 AUC**,
+while two well-timed retrains gain **+0.0079** — more than four times the
+benefit at a sixth of the cost. Champion vs Challenger's weekly shadow
+comparison lets us go one level deeper and ask the question directly, every
+single week: **would retraining this specific week actually have helped?**
+
+![Would retraining actually have helped this week?](visuals/25_retraining_would_help.png)
+
+**11 of 14 weeks, yes — the freshly-trained challenger beats the incumbent
+champion.** Only 3 weeks (3, 9, and 14) show a negative gap, where staying on
+the current model would have been the better choice. Week 14's gap is
+dramatic: **−0.1485 AUC**, an order of magnitude larger than any other
+week's swing in either direction — worth flagging honestly rather than
+averaging away: this is the last week of the replay, where the challenger's
+out-of-fold evaluation fold is smallest and noisiest, so this single point
+should be read with real caution rather than as strong evidence retraining
+"backfired." Weeks 3 and 9's negative gaps are much more modest (−0.002 and
+−0.011).
+
+**So if retraining would have helped in 11 of 14 weeks, why does the best
+policy (§3.5) only retrain twice?** Because "would help" and "is worth it"
+are different questions once cost enters the picture. Look at the magnitudes:
+of the 11 positive weeks, only **5** clear the 0.03 gap threshold (the dashed
+line in the chart) with enough statistical confidence to pass Champion vs
+Challenger's own significance gate (§3.3.10) — the other 6 are real but
+*small*, often well under the 0.004 AUC cost §4.2 assigns to a full retrain.
+Chasing all 11 would mean paying for 6 retrains whose benefit doesn't clearly
+exceed their cost, on top of the 5 that do. **This is the exact shape of
+problem a cheap partial-update action is built to solve** — Section 5 shows
+that once fine-tuning at roughly a quarter of a full retrain's cost is
+available, capturing most of those smaller, frequent gains stops being a bad
+trade, which is a large part of why "always partial update" alone reaches
+0.8820 in §5.3's decomposition. The classical detectors in this section can
+only ever choose between "pay for a full retrain" and "do nothing" — and
+against that binary choice, being selective about the big wins and ignoring
+the small ones is the right call. It stops being the right call once a third,
+cheaper option exists.
+
 > ### 🎤 Speaker Notes — Section 3
 >
 > - Lead with the confirmed-alarms bar chart, then immediately pivot to the
@@ -1153,6 +1268,23 @@ Three findings stand out:
 >   example of the persistence gate working as designed), and Champion vs
 >   Challenger (§3.3.10, the two-independent-triggers table is the best
 >   concrete illustration of why this detector's discipline beats the others).
+> - §3.6's feature-agreement heatmap is the single best slide in this section
+>   for a skeptical audience, and arguably in the whole talk — it is one image
+>   that proves, quantitatively, that "12 drift detectors" is not 12
+>   independent opinions worth averaging into a vote. Point at the two dark
+>   blocks (distributional: 0.78–0.96; representation: 0.81) and then at how
+>   dark those blocks *stop* being once you leave them (0.25–0.44) — that
+>   contrast is the whole argument in one picture. Follow it immediately with
+>   the week-agreement heatmap and the one-line payoff: feature agreement and
+>   week agreement are close to independent, so no single number (a vote
+>   count, a percentage) can summarise what these 12 methods are actually
+>   telling you.
+> - §3.7's "11 of 14 weeks, yes" number is a good one to have ready for "so
+>   should we just always retrain then?" — the honest answer is no, and the
+>   reason (most of those 11 wins are small, real, and not worth a full
+>   retrain's cost) is the single cleanest setup line for Section 4's partial-
+>   update action. If you only have time to build one bridge from Section 3
+>   into Section 4 live, use this one.
 
 ---
 
@@ -1178,10 +1310,24 @@ detector's design accounts for:
    permanently folds that turbulence into a cumulative training set, and the
    cost shows up weeks later, not immediately. Section 3.5 already showed
    this mechanism at work — busy detectors retrain into noise.
+4. **A vote across disagreeing detectors is not a real signal.** Section 3.6
+   showed that feature-level agreement and week-level agreement among the 12
+   detectors are close to independent axes — two detectors can point at the
+   same features but never fire in the same week, or fire together while
+   watching completely unrelated evidence. Collapsing that into "N of 12 say
+   drift" discards exactly the information (which detectors, agreeing on
+   what) that would let anyone judge whether the alarm is trustworthy.
 
 This is precisely the structure of a **Markov Decision Process**, so we frame
 it as one and learn the policy with reinforcement learning, instead of hand-
-tuning a threshold.
+tuning a threshold. Point 4 has a direct architectural consequence worth
+flagging now, before §4.2's state definition: the RL agent's state is built
+from **all twelve detectors' raw continuous outputs, fed in side by side**,
+never collapsed into a single boolean or a vote count first. It is not asked
+to trust a consensus that §3.6 already showed doesn't reliably exist —
+it gets to learn, from the reward signal, which combinations of detector
+outputs actually predicted trouble on *this* stream, which is a strictly
+richer input than any fixed voting rule could provide.
 
 ### 4.2 The MDP formulation
 
@@ -1243,12 +1389,15 @@ episodes affordable on a 14-window dataset.
 
 > ### 🎤 Speaker Notes — Section 4
 >
-> - The three-point list (model-state-dependence, non-binary choice, delayed
->   consequences) is the intellectual core of the whole project — if the
->   audience only remembers one slide's worth of content, make it this one.
->   Everything in Section 3 is evidence *for* points 2 and 3 specifically
->   (busy detectors retrain into noise = delayed consequences; no detector
->   knows if the model is already fresh = state-dependence).
+> - The four-point list (model-state-dependence, non-binary choice, delayed
+>   consequences, un-poolable disagreement) is the intellectual core of the
+>   whole project — if the audience only remembers one slide's worth of
+>   content, make it this one. Everything in Section 3 is evidence *for*
+>   these points specifically (busy detectors retrain into noise = delayed
+>   consequences; no detector knows if the model is already fresh =
+>   state-dependence; §3.6's agreement matrices = point 4, freshly added and
+>   arguably the most persuasive one for an audience that already trusts
+>   ensemble/voting methods elsewhere).
 > - The mermaid diagram is a genuine causal loop, not just decoration — trace
 >   it out loud: state → action → reward → *becomes* next state. Emphasise
 >   that the reward is graded one week *later* than the decision — that's the
@@ -1574,3 +1723,47 @@ a real but modest missed opportunity in what the learned policy captured.
 >   own result reversing, twice, is a stronger research artifact than one
 >   that reports a single clean number, and that's a good note to end a
 >   presentation on for an academic audience.
+
+### Contributions
+
+Here are 10 contributions, each phrased the way a paper's "Contributions" paragraph would, with the specific measured evidence behind it:
+
+1. Quantified the encoder-refitting artifact in drift pipelines.
+Showed that refitting feature encoders per window — the naive design most drift-monitoring demos use — manufactures false alarms: 35.4% of features flag "drift" between two random halves of the same data (no real drift possible), vs. 0.9% with a frozen, once-fit representation. Measurable: 39x reduction in false-alarm rate.
+
+2. A shared-model-registry design that makes cross-detector comparison sound, at a measured compute saving.
+Instead of each detector training its own model, one booster per week is shared across every detector that confirms — provably bounding distinct models at 1 + n_weeks regardless of detector count. Measurable: 15 distinct models trained vs. 36 the naive per-detector design would need — a 2.4x reduction — while making retraining comparisons apples-to-apples (bit-identical weights) for the first time.
+
+3. Demonstrated that classical drift detection and retraining-policy quality are separate, sometimes inversely-related, claims.
+Turned all 12 detectors into real retraining policies scored against budget-matched random-timing controls, not just "did it alarm." Measurable: ADWIN retrains 5 times yet lands at the 0.5th percentile of random-timing policies at equal cost — you'd beat it 99.5% of the time retraining at random weeks — while Champion vs Challenger's 2 retrains land at the 67.5th percentile.
+
+4. Quantified that a single well-timed retrain vastly outperforms high-frequency retraining.
+Measurable: 13 retrains (every week) improve mean AUC by only +0.0018 over never retraining; 2 well-timed retrains improve it by +0.0079 — 4.4x the benefit at 15% of the retraining cost.
+
+5. A calibrated, asymmetric consensus-threshold methodology for feature-vote detectors, with the resulting confirmed-alarm rate as evidence.
+Rather than one arbitrary global threshold, set each detector's supermajority bar (0.30 for KS/Jensen-Shannon/SHAP, 0.60 for PSI) from its own per-feature significance/effect-size discipline. Measurable: this changed the number of detectors ever confirming drift from 4/12 to 6/12, and is fully reproducible/auditable (documented threshold, not tuned to a target outcome).
+
+6. First quantitative separation of "when" detectors agree from "what" they agree about.
+Built two independent similarity measures — feature-implication cosine similarity and week-level Jaccard agreement — across all 12 detectors. Measurable: same-family detectors reach 0.78–0.96 feature-agreement (KS–PSI: 0.96; Clustering–Autoencoder: 0.81) vs. 0.25–0.44 cross-family (SHAP is the most isolated detector, never exceeding 0.44 with any other method); week-level agreement does not reproduce these family blocks at all (e.g., Jensen-Shannon–ADWIN timing agreement of 0.57 exceeds Jensen-Shannon–KS's 0.17, despite KS/JS being the closer relatives by feature substance).
+
+7. Directly measured how often retraining would help vs. hurt, per week, not just in aggregate.
+Using the champion/challenger shadow-model gap as ground truth. Measurable: 11 of 14 weeks retraining would have helped, 3 of 14 it would have hurt — and only 5 of those 11 "helpful" weeks clear the significance-gated threshold, explaining why an economically rational policy retrains only twice, not eleven times.
+
+8. A precomputed model-lattice construction that makes PPO training on a single 14-point trajectory tractable at all.
+Reduced the reachable-model space to 3 numbers (last full-retrain week, last partial-update week, ensemble weight), enumerated once, turning RL environment steps into O(1) lookups. Measurable: 16,800 transitions of PPO experience (150 updates × 8 episodes × 14 steps) simulated at zero marginal training cost per episode — thousands of episodes on a problem with only 14 real decision points.
+
+9. Decomposed the RL agent's advantage into "cheap action available" vs. "learned policy," with the split measured, not assumed.
+Measurable: the RL agent beats the best classical detector by 0.0135 AUC (0.8831 vs. 0.8696); ~92% of that gain (0.0124 of 0.0135) is captured by a naive always-partial-update policy with no learning at all — isolating the learned policy's own contribution to ~8%, and making "is RL worth it" an evidence-based rather than rhetorical question.
+
+10. Turned catastrophic forgetting from an assumed risk into a measured, recoverable quantity.
+By giving the agent a hedge action that blends toward a frozen baseline. Measurable: across 139 full-retrain/partial-update/evaluation-week combinations, hedging would have recovered AUC in 100% of cases, up to 0.0089 AUC, with the best correction usually gentle (α = 0.75 in 119 of 139 cases) — converting "does fine-tuning damage generalization" from a qualitative worry into a number with a confidence interval.
+
+A few more, specifically chosen to be easy to defend as "measurable" in a reviewer's eyes:
+
+11. A documented instance of a small-sample RL ablation's qualitative conclusion changing across reruns, with the magnitude of what triggered each flip recorded.
+Rare for a paper to report this rather than cherry-pick the cleanest run. Measurable: 3 distinct qualitative outcomes (context-sufficient → signals-sufficient → neither-sufficient-alone) across reruns, traceable to a specific bug fix and a specific threshold change — a concrete data point for "how fragile is a 14-point ablation," not just a caveat in prose.
+
+12. A found-and-fixed feature-engineering defect with before/after drift-rate evidence.
+The D2/D15 monotone-in-time-proxy bug. Measurable: D2's confirmed drift-crossing rate dropped from 14/14 weeks to 2/14 weeks after the fix — a concrete, falsifiable demonstration that the pipeline's drift signals are sensitive to (and can be corrupted by) feature-engineering bugs, and that auditing "why does this feature always flag" catches them.
+
+If this is going into a paper's contributions section, I'd suggest leading with #1, #3/#4 combined, #6, and #9 — those four are the ones most likely to survive a skeptical reviewer's "so what" question, since each has a control condition (random split, random-timing budget match, cross-family vs. within-family split, naive-baseline ablation) rather than a bare before/after number.

@@ -57,6 +57,10 @@ BASELINE = '#c3c2b7'
 STATUS_GOOD = '#0ca30c'
 STATUS_CRITICAL = '#d03b3b'
 
+# Sequential single-hue ramp (blue, light->dark) for magnitude/similarity heatmaps.
+SEQUENTIAL_BLUE = matplotlib.colors.LinearSegmentedColormap.from_list(
+    'sequential_blue', ['#fcfcfb', '#cde2fb', '#6da7ec', '#256abf', '#0d366b'])
+
 plt.rcParams.update({
     'font.family': 'sans-serif',
     'font.sans-serif': ['Segoe UI', 'Arial', 'DejaVu Sans'],
@@ -809,6 +813,158 @@ def chart_22_per_method_top_features():
     savefig(fig, '22_per_method_top_features.png')
 
 
+# ── 23: Feature-level agreement — do methods implicate the same features? ──
+# For each of the 6 feature-aware methods, build a 20-dim vector: how many of
+# the 14 weeks each monitored feature was "implicated" by that method (an
+# individual KS/PSI/Jensen-Shannon/SHAP flag, or a top-5 distance/reconstruction
+# contributor for Clustering/Autoencoder). Cosine similarity between two
+# methods' vectors then answers "do these two methods point at the same
+# features" as a single number — independent of whether the methods agree on
+# which *weeks* had drift (chart 24 answers that, separately).
+FEATURE_AWARE_METHODS = ['ks_stats', 'psi', 'kl_divergence', 'shap', 'clustering', 'autoencoder']
+FEATURE_METHOD_LABELS = {
+    'ks_stats': 'KS test', 'psi': 'PSI', 'kl_divergence': 'Jensen-Shannon',
+    'shap': 'SHAP', 'clustering': 'Clustering', 'autoencoder': 'Autoencoder',
+}
+
+
+def _feature_implication_vectors():
+    d = unified()
+    top_features = d['top_features']
+    idx = {f: i for i, f in enumerate(top_features)}
+    n = len(top_features)
+    vote_methods = ['ks_stats', 'psi', 'kl_divergence', 'shap']
+    vecs = {m: np.zeros(n) for m in FEATURE_AWARE_METHODS}
+
+    matrix = rl('method_week_matrix.csv')
+    for _, row in matrix.iterrows():
+        m = row['method']
+        if m in vote_methods and pd.notna(row['drifted_feature_names']):
+            for feat in str(row['drifted_feature_names']).split(';'):
+                feat = feat.strip()
+                if feat in idx:
+                    vecs[m][idx[feat]] += 1
+
+    for r in weekly_records():
+        for m in ['clustering', 'autoencoder']:
+            for item in r['method_status'][m].get('top_contributing_features', []):
+                f = item['feature']
+                if f in idx:
+                    vecs[m][idx[f]] += 1
+
+    return vecs, top_features
+
+
+def _cosine(a, b):
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    return float(a @ b / (na * nb)) if na > 0 and nb > 0 else 0.0
+
+
+def chart_23_feature_agreement():
+    vecs, _ = _feature_implication_vectors()
+    methods = FEATURE_AWARE_METHODS
+    labels = [FEATURE_METHOD_LABELS[m] for m in methods]
+    n = len(methods)
+    sim = np.zeros((n, n))
+    for i, m1 in enumerate(methods):
+        for j, m2 in enumerate(methods):
+            sim[i, j] = _cosine(vecs[m1], vecs[m2])
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+    im = ax.imshow(sim, cmap=SEQUENTIAL_BLUE, vmin=0, vmax=1)
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(labels, rotation=45, ha='right')
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(labels)
+    for i in range(n):
+        for j in range(n):
+            v = sim[i, j]
+            txt_color = 'white' if v > 0.6 else INK_PRIMARY
+            ax.text(j, i, f'{v:.2f}', ha='center', va='center', fontsize=10, color=txt_color)
+    for i in range(n + 1):
+        ax.axhline(i - 0.5, color=SURFACE, linewidth=2)
+        ax.axvline(i - 0.5, color=SURFACE, linewidth=2)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('Cosine similarity of feature-implication vectors', color=INK_SECONDARY)
+    cbar.ax.tick_params(colors=INK_MUTED)
+    ax.set_title('Do these detectors implicate the same features?\n'
+                 '(1.0 = identical feature-drift pattern, 0.0 = unrelated)', fontsize=12, pad=12)
+    style_axes(ax, hide_spines=('top', 'right', 'left', 'bottom'))
+    savefig(fig, '23_feature_agreement.png')
+
+
+# ── 24: Week-level agreement — did detectors fire in the same weeks? ───────
+# Different question from chart 23: this is pairwise Jaccard similarity over
+# *which weeks each detector raised a raw alarm*, already computed by the
+# pipeline (reports/detector_agreement.csv) — reused here, not recomputed.
+def chart_24_week_agreement():
+    df = rl('detector_agreement.csv').set_index(rl('detector_agreement.csv').columns[0])
+    label_map = {
+        'ks_stats': 'KS test', 'psi': 'PSI', 'kl_divergence': 'Jensen-Shannon',
+        'ddm': 'DDM', 'eddm': 'EDDM', 'adwin': 'ADWIN', 'hddm': 'HDDM',
+        'shap': 'SHAP', 'clustering': 'Clustering', 'autoencoder': 'Autoencoder',
+        'prequential_auc': 'Prequential AUC', 'champion_vs_challenger': 'Champion vs Challenger',
+    }
+    methods = list(df.columns)
+    labels = [label_map.get(m, m) for m in methods]
+    mat = df.loc[methods, methods].to_numpy(dtype=float)
+    mat_masked = np.ma.masked_invalid(mat)
+
+    fig, ax = plt.subplots(figsize=(10, 9))
+    cmap = SEQUENTIAL_BLUE.copy()
+    cmap.set_bad(GRIDLINE)
+    im = ax.imshow(mat_masked, cmap=cmap, vmin=0, vmax=1)
+    ax.set_xticks(range(len(methods)))
+    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=9)
+    ax.set_yticks(range(len(methods)))
+    ax.set_yticklabels(labels, fontsize=9)
+    for i in range(len(methods)):
+        for j in range(len(methods)):
+            v = mat[i, j]
+            if np.isnan(v):
+                continue
+            txt_color = 'white' if v > 0.6 else INK_PRIMARY
+            ax.text(j, i, f'{v:.2f}', ha='center', va='center', fontsize=8, color=txt_color)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('Jaccard similarity of raw-alarm weeks', color=INK_SECONDARY)
+    cbar.ax.tick_params(colors=INK_MUTED)
+    ax.set_title('Did these detectors raise raw alarms in the same weeks?\n'
+                 '(grey = at least one detector never raised a raw alarm — undefined overlap)',
+                 fontsize=12, pad=12)
+    style_axes(ax, hide_spines=('top', 'right', 'left', 'bottom'))
+    savefig(fig, '24_week_agreement.png')
+
+
+# ── 25: Would retraining actually have helped? Champion vs Challenger, signed ──
+def chart_25_retraining_would_help():
+    weeks, gaps = [], []
+    for r in weekly_records():
+        c = r['method_status']['champion_vs_challenger']
+        weeks.append(r['week'])
+        gaps.append(c['auc_gap'])
+
+    colors = [GREEN if g > 0 else RED for g in gaps]
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    ax.bar(weeks, gaps, color=colors, width=0.6, zorder=3)
+    ax.axhline(0, color=INK_MUTED, linewidth=1)
+    ax.axhline(0.03, color=INK_MUTED, linewidth=1, linestyle='--')
+    ax.text(0.3, 0.032, 'Gap threshold (0.03)', fontsize=8, color=INK_MUTED)
+    n_help = sum(1 for g in gaps if g > 0)
+    n_hurt = sum(1 for g in gaps if g < 0)
+    ax.set_xlabel('Week')
+    ax.set_ylabel('AUC gap (challenger − champion)')
+    ax.set_title(f'Would retraining actually have helped this week? '
+                 f'{n_help} of 14 weeks yes, {n_hurt} of 14 no',
+                 fontsize=12, pad=12)
+    handles = [mpatches.Patch(color=GREEN, label='Retraining would have helped'),
+               mpatches.Patch(color=RED, label='Retraining would have hurt')]
+    ax.legend(handles=handles, frameon=False, loc='lower left')
+    ax.grid(axis='y', linewidth=0.6, zorder=0)
+    ax.set_axisbelow(True)
+    style_axes(ax)
+    savefig(fig, '25_retraining_would_help.png')
+
+
 if __name__ == '__main__':
     print(f'Reading reports from: {REPORTS_DIR}')
     print(f'Writing visuals to:   {VISUALS_DIR}')
@@ -834,4 +990,7 @@ if __name__ == '__main__':
     chart_20_clustering_feature_contributions()
     chart_21_autoencoder_feature_contributions()
     chart_22_per_method_top_features()
+    chart_23_feature_agreement()
+    chart_24_week_agreement()
+    chart_25_retraining_would_help()
     print('Done.')
